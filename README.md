@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@258a1f9 -->
+<!-- docs: sync from coderbuzz/codex@4dfdb6b -->
 
 # KVS REST &mdash; `@coderbuzz/kvs-rest`
 
