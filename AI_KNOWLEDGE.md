@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@cb90530 -->
+<!-- docs: sync from coderbuzz/codex@b724e01 -->
 
 # KVS Server — AI Agent Knowledge File
 
@@ -50,7 +50,7 @@ await server.run();
 All require `Authorization: Bearer <TOKEN>` (except `/health`):
 
 - `GET /health`
-- `POST /kv/get`, `/kv/set`, `/kv/delete`, `/kv/list`, `/kv/atomic`, `/kv/reset`
+- `POST /kv/get`, `/kv/set`, `/kv/delete`, `/kv/list`, `/kv/atomic`, `/kv/reset`, `/kv/clean-expired`
 - `POST /queue/enqueue`, `/queue/dequeue`, `/queue/ack`
 
 WebSocket `ws://host/ws` — same methods as JSON-RPC, plus push for watch/queue.
