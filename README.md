@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@7e5d1ab -->
+<!-- docs: sync from coderbuzz/codex@cb90530 -->
 
 # KVS Server &mdash; `@coderbuzz/kvs-server`
 
@@ -21,7 +21,7 @@ KVS Server wraps `@coderbuzz/kvs` `KVStore` into a production-ready HTTP server 
 
 ## Features
 
-- **REST API** — full CRUD, list, atomic transactions, queue operations
+- **REST API** — full CRUD, list, atomic transactions, queue operations, manual expiry
 - **WebSocket RPC** — lower latency than REST for high-throughput workloads
 - **Bearer-token auth** — protects all endpoints (except `/health`)
 - **WebSocket watch** — real-time key-change subscriptions
@@ -110,6 +110,7 @@ GET /health
 | `/kv/list` | `{ prefix?, start?, end?, limit?, cursor?, reverse? }` | `{ entries, cursor }` |
 | `/kv/atomic` | `{ checks?, mutations?, enqueues? }` | `{ ok, version }` or `{ ok: false }` |
 | `/kv/reset` | `{}` | `{ ok }` |
+| `/kv/clean-expired` | `{}` | `{ ok, deleted }` |
 
 ### Queue (all POST)
 
