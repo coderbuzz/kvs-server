@@ -1,17 +1,17 @@
-<!-- docs: sync from coderbuzz/codex@4dfdb6b -->
+<!-- docs: sync from coderbuzz/codex@7e5d1ab -->
 
-# KVS REST &mdash; `@coderbuzz/kvs-rest`
+# KVS Server &mdash; `@coderbuzz/kvs-server`
 
 > **HTTP REST + WebSocket server wrapper for `@coderbuzz/kvs`.** Expose your KV store as a full-featured HTTP API with WebSocket RPC, watch, and push-based queue listeners.
-> AI agents: see [AI_KNOWLEDGE.md](https://github.com/coderbuzz/kvs-rest/blob/main/AI_KNOWLEDGE.md) for expert context.
+> AI agents: see [AI_KNOWLEDGE.md](https://github.com/coderbuzz/kvs-server/blob/main/AI_KNOWLEDGE.md) for expert context.
 
-KVS REST wraps `@coderbuzz/kvs` `KVStore` into a production-ready HTTP server with REST endpoints and a WebSocket JSON-RPC interface. It handles authentication, routing, WebSocket upgrade, and protocol translation.
+KVS Server wraps `@coderbuzz/kvs` `KVStore` into a production-ready HTTP server with REST endpoints and a WebSocket JSON-RPC interface. It handles authentication, routing, WebSocket upgrade, and protocol translation.
 
 ---
 
-## Why KVS REST?
+## Why KVS Server?
 
-`@coderbuzz/kvs` is the **store engine** (SQLite-backed KV operations). `@coderbuzz/kvs-rest` is the **server layer** that exposes it over HTTP/WS. Separating them means:
+`@coderbuzz/kvs` is the **store engine** (SQLite-backed KV operations). `@coderbuzz/kvs-server` is the **server layer** that exposes it over HTTP/WS. Separating them means:
 
 - The **store** can be embedded directly in your app without HTTP overhead
 - The **server** can be swapped, extended, or deployed independently
@@ -33,10 +33,10 @@ KVS REST wraps `@coderbuzz/kvs` `KVStore` into a production-ready HTTP server wi
 ## Installation
 
 ```sh
-npm install @coderbuzz/kvs @coderbuzz/kvs-rest
+npm install @coderbuzz/kvs @coderbuzz/kvs-server
 ```
 
-KVS REST requires `@coderbuzz/kvs` as a peer (the store engine).
+KVS Server requires `@coderbuzz/kvs` as a peer (the store engine).
 
 ---
 
@@ -44,7 +44,7 @@ KVS REST requires `@coderbuzz/kvs` as a peer (the store engine).
 
 ```ts
 import { KVStore } from "@coderbuzz/kvs";
-import { createServer } from "@coderbuzz/kvs-rest";
+import { createServer } from "@coderbuzz/kvs-server";
 
 const store = new KVStore("kv.db");
 const server = createServer(store, {
@@ -125,12 +125,12 @@ GET /health
 
 Endpoint: `ws://host/ws` or `ws://host/ws?token=TOKEN`
 
-Uses JSON-RPC format. All methods match their REST counterparts (e.g., `/kv/get`, `/kv/set`).
+Uses JSON-RPC format. All methods match their REST counterparts.
 
 ### Auth
 
 Two modes:
-1. **Query param** — `ws://host/ws?token=TOKEN` (authenticated at upgrade time)
+1. **Query param** — `ws://host/ws?token=TOKEN`
 2. **Post-connect** — first message must be `{ id, method: "auth", params: { token } }`
 
 ### Push Events
