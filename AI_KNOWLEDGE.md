@@ -1,8 +1,8 @@
-<!-- docs: sync from coderbuzz/codex@5f93304 -->
+<!-- docs: sync from coderbuzz/codex@7af404c -->
 
 # KVS Server — AI Agent Knowledge File
 
-**Package:** `@coderbuzz/kvs-server` v0.1.9
+**Package:** `@coderbuzz/kvs-server` v0.1.10
 **Purpose:** HTTP REST + WebSocket server wrapper for `@coderbuzz/kvs`. Exposes KVStore or AsyncKVStore as a network-accessible server.
 **Distribution:** ESM only (`dist/index.js` + `dist/index.d.ts`).
 

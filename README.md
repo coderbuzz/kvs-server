@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@5f93304 -->
+<!-- docs: sync from coderbuzz/codex@7af404c -->
 
 # KVS Server &mdash; `@coderbuzz/kvs-server`
 
@@ -113,6 +113,21 @@ Same interface as `createServer` but accepts `AsyncKVStore` instead of `KVStore`
 | `options.port` | `number` | `3000` | HTTP server port |
 | `options.hostname` | `string` | `"0.0.0.0"` | Bind address |
 | `options.accessToken` | `string` | required | Bearer token for auth |
+
+---
+
+## Benchmarks
+
+Full results at **[github.com/coderbuzz/benchmarks](https://github.com/coderbuzz/benchmarks)**.
+
+KVS Server transport overhead vs direct KVStore access (Apple M-series, Bun):
+
+| Scenario | KVS direct | WS RPC | HTTP REST |
+|---|---|---|---|
+| set('k','v') | **158,732 ops/s** | 53,999 ops/s (2.9x) | 19,433 ops/s (8.2x) |
+| get('k') — hit | **1,160,021 ops/s** | 55,723 ops/s (20.8x) | 24,973 ops/s (46.4x) |
+
+HTTP REST overhead includes JSON serialization, TCP round-trip, and uWebSockets routing (~2-8x slower than direct). WebSocket RPC amortizes connection overhead and is ~2x faster than REST for writes and ~2x for reads.
 
 ---
 
