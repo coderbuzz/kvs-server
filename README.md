@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@46af4b9 -->
+<!-- docs: sync from coderbuzz/codex@5f93304 -->
 
 # KVS Server &mdash; `@coderbuzz/kvs-server`
 
@@ -11,7 +11,7 @@
   <a href="https://github.com/coderbuzz/kvs-server"><img src="https://img.shields.io/github/stars/coderbuzz/kvs-server.svg?style=flat-square" alt="GitHub Stars" /></a>
 </p>
 
-KVS Server wraps `@coderbuzz/kvs` `KVStore` into a production-ready HTTP server with REST endpoints and a WebSocket JSON-RPC interface. It handles authentication, routing, WebSocket upgrade, and protocol translation.
+KVS Server wraps `@coderbuzz/kvs` (`KVStore` or `AsyncKVStore`) into a production-ready HTTP server with REST endpoints and a WebSocket JSON-RPC interface. It handles authentication, routing, WebSocket upgrade, and protocol translation.
 
 ---
 
@@ -49,30 +49,39 @@ KVS Server requires `@coderbuzz/kvs` as a peer (the store engine).
 ## Quick Start
 
 ```ts
-import { KVStore } from "@coderbuzz/kvs";
-import { createServer } from "@coderbuzz/kvs-server";
+import { KVStore, AsyncKVStore } from "@coderbuzz/kvs";
+import { createServer, createAsyncServer } from "@coderbuzz/kvs-server";
 
+// Sync (SQLite via bun:sqlite)
 const store = new KVStore("kv.db");
 const server = createServer(store, {
   port: 3000,
   hostname: "0.0.0.0",
   accessToken: "your-secret-token",
 });
+await server.run();
 
-server.printRoutes();
-const { hostname, port } = await server.run();
-console.log(`KVS listening on ${hostname}:${port}`);
+// Async (SQLite or PostgreSQL via bun:sql)
+const asyncStore = new AsyncKVStore("postgres://user:pass@localhost:5432/kvdb");
+const asyncServer = createAsyncServer(asyncStore, {
+  port: 3001,
+  accessToken: "your-secret-token",
+});
+await asyncServer.run();
 ```
 
 ### Graceful Shutdown
 
 ```ts
+// Sync
 process.on("SIGINT", () => {
   store.close();
   process.exit(0);
 });
-process.on("SIGTERM", () => {
-  store.close();
+
+// Async
+process.on("SIGINT", async () => {
+  await asyncStore.close();
   process.exit(0);
 });
 ```
@@ -93,6 +102,17 @@ Creates an HTTP server with REST + WebSocket endpoints.
 | `options.accessToken` | `string` | required | Bearer token for auth |
 
 Returns a Ken `AppServer` instance.
+
+### `createAsyncServer(store, options): AppServer`
+
+Same interface as `createServer` but accepts `AsyncKVStore` instead of `KVStore`. All store calls are awaited internally.
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `store` | `AsyncKVStore` | required | An instance from `@coderbuzz/kvs` |
+| `options.port` | `number` | `3000` | HTTP server port |
+| `options.hostname` | `string` | `"0.0.0.0"` | Bind address |
+| `options.accessToken` | `string` | required | Bearer token for auth |
 
 ---
 
