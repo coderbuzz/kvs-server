@@ -1,9 +1,15 @@
-<!-- docs: sync from coderbuzz/codex@cd4a13b -->
+<!-- docs: sync from coderbuzz/codex@46af4b9 -->
 
 # KVS Server &mdash; `@coderbuzz/kvs-server`
 
 > **HTTP REST + WebSocket server wrapper for `@coderbuzz/kvs`.** Expose your KV store as a full-featured HTTP API with WebSocket RPC, watch, and push-based queue listeners.
 > AI agents: see [AI_KNOWLEDGE.md](https://github.com/coderbuzz/kvs-server/blob/main/AI_KNOWLEDGE.md) for expert context.
+<p align="center">
+  <a href="https://www.npmjs.com/package/@coderbuzz/kvs-server"><img src="https://img.shields.io/npm/v/@coderbuzz/kvs-server.svg?style=flat-square" alt="npm version" /></a>
+  <a href="https://www.npmjs.com/package/@coderbuzz/kvs-server"><img src="https://img.shields.io/npm/dm/@coderbuzz/kvs-server.svg?style=flat-square" alt="npm downloads" /></a>
+  <a href="https://github.com/coderbuzz/kvs-server/blob/main/LICENSE"><img src="https://img.shields.io/github/license/coderbuzz/kvs-server.svg?style=flat-square" alt="MIT License" /></a>
+  <a href="https://github.com/coderbuzz/kvs-server"><img src="https://img.shields.io/github/stars/coderbuzz/kvs-server.svg?style=flat-square" alt="GitHub Stars" /></a>
+</p>
 
 KVS Server wraps `@coderbuzz/kvs` `KVStore` into a production-ready HTTP server with REST endpoints and a WebSocket JSON-RPC interface. It handles authentication, routing, WebSocket upgrade, and protocol translation.
 
