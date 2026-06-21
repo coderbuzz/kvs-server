@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@e5210d1 -->
+<!-- docs: sync from coderbuzz/codex@e9b6bce -->
 
 # KVS Server &mdash; `@coderbuzz/kvs-server`
 
@@ -9,8 +9,8 @@
   <a href="https://www.npmjs.com/package/@coderbuzz/kvs-server"><img src="https://img.shields.io/npm/dm/@coderbuzz/kvs-server.svg?style=flat-square" alt="npm downloads" /></a>
   <a href="https://github.com/coderbuzz/kvs-server/blob/main/LICENSE"><img src="https://img.shields.io/github/license/coderbuzz/kvs-server.svg?style=flat-square" alt="MIT License" /></a>
   <a href="https://github.com/coderbuzz/kvs-server"><img src="https://img.shields.io/github/stars/coderbuzz/kvs-server.svg?style=flat-square" alt="GitHub Stars" /></a>
-  <a href="https://github.com/coderbuzz/codex/actions/workflows/ci.kvs-server.yml"><img src="https://github.com/coderbuzz/codex/actions/workflows/ci.kvs-server.yml/badge.svg" alt="CI" /></a>
-  <a href="https://codecov.io/gh/coderbuzz/codex"><img src="https://codecov.io/gh/coderbuzz/codex/graph/badge.svg?flag=kvs-server" alt="Codecov" /></a>
+  <a href="https://github.com/coderbuzz/kvs-server/actions/workflows/ci.yml"><img src="https://github.com/coderbuzz/kvs-server/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://codecov.io/gh/coderbuzz/kvs-server"><img src="https://codecov.io/gh/coderbuzz/kvs-server/graph/badge.svg" alt="Codecov" /></a>
 </p>
 
 KVS Server wraps `@coderbuzz/kvs` (`KVStore` or `AsyncKVStore`) into a production-ready HTTP server with REST endpoints and a WebSocket JSON-RPC interface. It handles authentication, routing, WebSocket upgrade, and protocol translation.
