@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@c0ec729 -->
+<!-- docs: sync from coderbuzz/codex@34f92e9 -->
 
 # KVS Server &mdash; `@coderbuzz/kvs-server`
 
@@ -31,8 +31,9 @@ KVS Server wraps `@coderbuzz/kvs` (`KVStore` or `AsyncKVStore`) into a productio
 
 - **REST API** — full CRUD, list, atomic transactions, queue operations, manual expiry
 - **WebSocket RPC** — lower latency than REST for high-throughput workloads
-- **Bearer-token auth** — protects all endpoints (except `/health`)
-- **WebSocket watch** — real-time key-change subscriptions with push delivery
+- **Scoped bearer auth** — read/write/queue/admin roles with encoded key-prefix and queue-topic scopes
+- **Grouped WebSocket watch** — one store watch and serialization per identical ordered subscription
+- **Backpressure control** — bounded buffers, latest-state coalescing, drain recovery, and structured slow-consumer closes
 - **Push-based queue** — work-stealing distribution across connected listeners
 - **Health checks** — unauthenticated `/health` endpoint
 - **Dual backend** — `createServer()` for sync `KVStore`, `createAsyncServer()` for async `AsyncKVStore` (PostgreSQL, async SQLite)
@@ -77,6 +78,10 @@ const server = createServer(store, {
   port: 3000,
   hostname: "0.0.0.0",
   accessToken: "your-secret-token",
+  readToken: "player-read-token",
+  adminToken: "separate-admin-token",
+  legacyAccessTokenRole: "write",
+  allowQueryToken: false,
 });
 await server.run();
 
@@ -119,6 +124,15 @@ Creates an HTTP server with REST + WebSocket endpoints wrapping a sync `KVStore`
 | `options.port` | `number` | `3000` | HTTP server port |
 | `options.hostname` | `string` | `"0.0.0.0"` | Bind address |
 | `options.accessToken` | `string` | required | Bearer token for auth |
+| `options.readToken` | `string` | — | Read/list/watch-only credential |
+| `options.writeToken` | `string` | — | Read/write/atomic/publish credential |
+| `options.adminToken` | `string` | — | Administrative credential |
+| `options.credentials` | `KvsCredential[]` | `[]` | Role credentials with key/topic scopes |
+| `options.legacyAccessTokenRole` | `KvsRole` | `"admin"` | Compatibility role for `accessToken` |
+| `options.allowQueryToken` | `boolean` | `true` | Allow deprecated `?token=` WS auth; set false in production |
+| `options.maxPayloadLength` | `number` | `4 MiB` | Maximum inbound WebSocket RPC frame |
+| `options.authTimeoutMs` | `number` | `5000` | Time allowed for post-connect authentication |
+| `options.watch` | `WatchHubOptions` | see below | Watch count, event, buffer, and grace limits |
 
 Returns a velox `AppServer` instance with methods:
 
@@ -145,7 +159,9 @@ Same interface as `createServer` but accepts `AsyncKVStore` instead of `KVStore`
 
 All endpoints except `GET /health` require: `Authorization: Bearer <ACCESS_TOKEN>`
 
-Auth middleware is applied to `/kv/*` routes. Queue endpoints (`/queue/*`) are **not** currently behind auth middleware (verify before production deploy).
+Auth middleware protects both `/kv/*` and `/queue/*`. Per-operation role,
+encoded key-prefix, atomic-item, and queue-topic authorization is enforced after
+authentication.
 
 ### Health
 
@@ -267,7 +283,8 @@ GET /health
 // Response
 { "ok": true }
 ```
-Deletes ALL data from `kv` and `queue` tables. Cancels all watchers.
+Deletes ALL data from `kv` and `queue` tables. Active watches receive reset
+tombstones and remain subscribed. Admin role is required.
 
 #### `POST /kv/clean-expired`
 
@@ -344,24 +361,35 @@ Uses JSON-RPC format. All methods mirror their REST counterparts. Server default
 
 | Setting | Value |
 |---|---|
-| `maxPayloadLength` | 16 MB |
-| `backpressureLimit` | 16 MB |
+| `maxPayloadLength` | 4 MB |
+| `backpressureLimit` | 4 MB |
 | `pingInterval` | 30 s |
 | `pongTimeout` | 10 s |
 | `idleTimeout` | 120 s |
 | `perMessageDeflate` | disabled |
 
+KVS also enables runtime close-on-backpressure and applies these watch defaults:
+
+| Watch option | Default |
+|---|---:|
+| `maxWatchKeys` | 32 |
+| `maxEventBytes` | 2 MiB |
+| `softBufferBytes` | 2 MiB |
+| `hardBufferBytes` | 4 MiB |
+| `slowConsumerGraceMs` | 15,000 ms |
+
 ### Auth
 
 Two modes:
 
-**Mode 1: Query parameter (pre-authenticated)**
+**Mode 1: Query parameter (deprecated compatibility mode)**
 ```
 ws://host:port/ws?token=ACCESS_TOKEN
 ```
-- If token matches → connection upgraded with `authenticated: true`
+- If token matches → connection upgraded with the resolved principal
 - If token wrong → rejected with HTTP 401 `"Unauthorized"`
-- If no `?token=` → connection upgraded with `authenticated: false` (must use Mode 2)
+- If no `?token=` → connection must authenticate with Mode 2 within the configured timeout
+- Set `allowQueryToken: false` in production so credentials do not enter URL/proxy logs.
 
 **Mode 2: Post-connect RPC auth**
 ```json
@@ -393,7 +421,7 @@ ws://host:port/ws?token=ACCESS_TOKEN
 
 **Server → Client (push — unsolicited, no `id`):**
 ```json
-{ "type": "watch", "entries": [...] }
+{ "type": "watch", "entries": [...], "sequence": 42 }
 { "type": "queue", "topic": "...", "message": {...} }
 ```
 
@@ -440,9 +468,13 @@ Subscribe to key-change notifications:
 
 **Behavior:**
 - Only ONE watcher per connection — calling again cancels the previous.
+- Connections requesting the same ordered key list share one store watcher, one committed snapshot, and one JSON serialization.
 - Fires **immediately** with current values for all keys on subscribe.
-- On every mutation (`set`/`delete`/`increment`/`atomic.commit`) to any watched key, fires again with full set of current values for ALL watched keys.
+- One callback is emitted per committed batch. Atomic changes to multiple watched keys do not duplicate the event.
+- Expiry and reset emit `null` tombstones. Reset keeps the subscription active.
 - `entries` matches the order and length of requested `keys`. `null` for non-existent keys.
+- `sequence` is process-local ordering metadata, not a durable resume cursor.
+- A blocked peer retains only the latest pending snapshot. Persistent slow consumers close with code `4008`; oversized events close with `4009`.
 
 ### Queue Listen
 
@@ -489,7 +521,7 @@ Push-based queue message delivery with work-stealing (round-robin):
 ### Connection Cleanup
 
 On WebSocket close:
-1. Active watcher (if any) is canceled (removed from watch index).
+1. The peer is removed from its WatchHub group; the shared store watcher is canceled when its last peer leaves.
 2. All queue listeners are canceled (removed from listener sets). Dispatch timer may stop if no listeners remain.
 
 ---
@@ -514,14 +546,28 @@ requeue → pending (up to maxAttempts)
 
 1. `accessToken` is required — no default. Auth failures return 401.
 2. `createServer()` → sync `KVStore`, `createAsyncServer()` → async `AsyncKVStore`. Wrong pairing causes runtime errors.
-3. WebSocket auth can be via query param `?token=` OR post-connect `auth` RPC. Both are supported.
+3. Query token auth is retained for compatibility but should be disabled with `allowQueryToken: false` in production.
 4. Only ONE watcher per WebSocket connection — calling `/kv/watch` again cancels the previous.
 5. Queue listeners are per-topic per-connection — calling `/queue/listen` for same topic overwrites. Multiple topics per connection OK.
-6. Queue endpoints (`/queue/*`) are currently NOT behind the auth middleware (only `/kv/*` is). Verify before deploying to production.
-7. `reset()` deletes ALL data and cancels all watchers. Not reversible.
+6. Both `/kv/*` and `/queue/*` require authentication. Authorization is applied again per operation, key prefix, and queue topic.
+7. `reset()` is admin-only, deletes ALL data, and emits reset tombstones while preserving active watches. It is not reversible.
 8. The server uses velox internally — `AppServer` has `.printRoutes()` for debugging registered endpoints.
 9. TTL cleanup and message requeue timers run within the KVStore instance, not the server. They start on store construction, stop on store `.close()`.
 10. No `increment` HTTP/WS endpoint — increment is a store-level operation, not exposed as a separate RPC. Use `get` + `set` or `atomic()` for counters.
+
+### Watch benchmark harness
+
+Run a real-socket load test against a separately started server:
+
+```sh
+bun run --cwd packages/kvs-server bench:watch -- \
+  --url http://127.0.0.1:3000 --token TOKEN \
+  --clients 5000 --channels 1 --payload-bytes 100000 --updates 3
+```
+
+The harness reports connection time, p50/p95/p99/last delivery, runtime metadata,
+and exact store/WatchHub counters. Establish production SLOs from measured host
+and network results rather than the example workload.
 
 ---
 

@@ -1,8 +1,8 @@
-<!-- docs: sync from coderbuzz/codex@c0ec729 -->
+<!-- docs: sync from coderbuzz/codex@34f92e9 -->
 
 # KVS Server — AI Agent Knowledge File
 
-**Package:** `@coderbuzz/kvs-server` v0.1.10
+**Package:** `@coderbuzz/kvs-server`
 **Purpose:** HTTP REST + WebSocket server wrapper for `@coderbuzz/kvs`. Exposes `KVStore` or `AsyncKVStore` as a network-accessible server.
 **Distribution:** ESM only (`dist/index.js` + `dist/index.d.ts`).
 **Built on:** [velox](https://github.com/coderbuzz/velox) (uWebSockets.js) + [veta](https://github.com/coderbuzz/veta) (schema validation)
@@ -27,11 +27,14 @@ import { KVStore, AsyncKVStore } from "@coderbuzz/kvs";
 import {
   createServer,
   createAsyncServer,
+  type CreateServerOptions,
   type CreateAsyncServerOptions,
+  type KvsCredential,
+  type KvsRole,
+  type WatchHubOptions,
+  type WatchHubDiagnostics,
 } from "@coderbuzz/kvs-server";
 ```
-
-Note: `CreateServerOptions` is not currently re-exported as a named type from the public barrel. Use `Parameters<typeof createServer>[1]` or import from `@coderbuzz/kvs-server/src/routes` if needed.
 
 ---
 
@@ -89,6 +92,15 @@ Creates an HTTP server wrapping a sync `KVStore`.
 | `options.port` | `number` | `3000` | HTTP server port |
 | `options.hostname` | `string` | `"0.0.0.0"` | Bind address |
 | `options.accessToken` | `string` | required | Bearer token for auth |
+| `options.readToken` | `string` | — | Read/list/watch credential |
+| `options.writeToken` | `string` | — | Read/write/atomic/queue-enqueue credential |
+| `options.adminToken` | `string` | — | Administrative credential |
+| `options.credentials` | `KvsCredential[]` | `[]` | Additional role/scoped credentials |
+| `options.legacyAccessTokenRole` | `"read" \| "write" \| "queue" \| "admin"` | `"admin"` | Role assigned to legacy access token |
+| `options.allowQueryToken` | `boolean` | `true` | Deprecated WS query-token compatibility |
+| `options.maxPayloadLength` | `number` | `4_194_304` | Inbound WS frame bytes |
+| `options.authTimeoutMs` | `number` | `5000` | Post-connect auth deadline |
+| `options.watch` | `WatchHubOptions` | defaults below | Grouping/backpressure policy |
 
 Returns a velox `AppServer` with methods: `.run()`, `.stop()`, `.printRoutes()`.
 
@@ -107,9 +119,12 @@ Same as `createServer` but wraps an async `AsyncKVStore`. All store calls are aw
 
 ## HTTP Endpoints
 
-All endpoints except `GET /health` require: `Authorization: Bearer <ACCESS_TOKEN>`
-
-Auth middleware is applied to `/kv/*` routes via `app.apply("/kv/*", bearerAuth({ token }))`.
+All endpoints except `GET /health` require `Authorization: Bearer <TOKEN>`.
+Bearer middleware protects both `/kv/*` and `/queue/*`; every handler then
+authorizes its action, all atomic keys, encoded key prefixes, and queue topics.
+`accessToken` remains admin by default for compatibility. Use
+`legacyAccessTokenRole: "write"`, a separate `adminToken`, and read/scoped
+credentials during migration.
 
 ### Health
 
@@ -230,7 +245,8 @@ Validated by veta: `key` must be `array(union([string, number, bigint, boolean, 
 // Response
 { "ok": true }
 ```
-Deletes ALL data from `kv` and `queue` tables. Clears all watchers.
+Deletes ALL data from `kv` and `queue` tables. Admin-only. Watchers receive
+`null` entries with `reset: true` and remain registered.
 
 #### `POST /kv/clean-expired`
 
@@ -243,9 +259,13 @@ Deletes ALL data from `kv` and `queue` tables. Clears all watchers.
 ```
 Manually delete expired KV entries. Returns count of removed rows. (Auto-runs every 60s on server.)
 
-### Queue Endpoints (all POST, currently NOT behind auth middleware)
+### Queue Endpoints (all POST, authenticated and authorized)
 
-**Note:** Queue endpoints (`/queue/*`) are currently NOT covered by the `/kv/*` auth apply. They may be unauthenticated in the current source. Check the source if auth is critical.
+Bearer authentication is applied to `/queue/*`. Queue roles and optional topic
+allowlists are enforced per operation. Scoped queue credentials cannot
+acknowledge by bare ID because the current protocol does not carry a verifiable
+topic; use an unscoped queue/admin credential for ack until topic-aware ack is
+introduced.
 
 #### `POST /queue/enqueue`
 
@@ -306,9 +326,10 @@ Manually delete expired KV entries. Returns count of removed rows. (Auto-runs ev
 
 Uses JSON-RPC format. All methods mirror their REST counterparts.
 
-**Velox WebSocket defaults:**
-- `maxPayloadLength`: 16 MB
-- `backpressureLimit`: 16 MB
+**KVS WebSocket defaults:**
+- `maxPayloadLength`: 4 MiB
+- `backpressureLimit`: 4 MiB
+- `closeOnBackpressureLimit`: true
 - `pingInterval`: 30 s
 - `pongTimeout`: 10 s
 - `idleTimeout`: 120 s
@@ -318,13 +339,13 @@ Uses JSON-RPC format. All methods mirror their REST counterparts.
 
 Two modes:
 
-**Mode 1: Query parameter (pre-authenticated)**
+**Mode 1: Query parameter (deprecated compatibility mode)**
 ```
 ws://host:port/ws?token=ACCESS_TOKEN
 ```
-- If token matches → connection upgraded with `authenticated: true`
+- If token matches → connection upgraded with the resolved principal
 - If token wrong → rejected with HTTP 401 `"Unauthorized"`
-- If no `?token=` → connection upgraded with `authenticated: false` (must use Mode 2)
+- If no `?token=` → connection must authenticate through Mode 2 before timeout
 
 **Mode 2: Post-connect RPC auth**
 ```json
@@ -339,9 +360,15 @@ ws://host:port/ws?token=ACCESS_TOKEN
 
 **Peer data shape:**
 ```ts
-{ authenticated: boolean; queueListeners: Map<string, { cancel: () => void }> }
+{
+  principal: AuthPrincipal | null
+  queueListeners: Map<string, { cancel: () => void }>
+  authTimer: ReturnType<typeof setTimeout> | null
+}
 ```
-`authenticated` starts as `false` (Mode 2) or `true` (Mode 1 with valid `?token=`). `queueListeners` initializes as empty map on upgrade.
+Unauthenticated sockets have 5 seconds by default to complete `auth`. Query
+tokens can be disabled with `allowQueryToken: false` and should be disabled in
+production to avoid URL logging.
 
 ### Message Format (JSON-RPC style)
 
@@ -364,7 +391,7 @@ ws://host:port/ws?token=ACCESS_TOKEN
 
 **Server → Client (push — unsolicited, no `id`):**
 ```json
-{ "type": "watch", "entries": [...] }
+{ "type": "watch", "entries": [...], "sequence": 42, "reset": false }
 { "type": "queue", "topic": "...", "message": {...} }
 ```
 
@@ -400,11 +427,23 @@ Subscribe to key-change notifications.
 ```
 
 **Behavior:**
-1. Only ONE watcher per connection — calling again cancels the previous (calls `peer.data.watcher.cancel()`).
-2. Fires **immediately** with current values for all keys on subscribe.
-3. On every mutation (`set`/`delete`/`increment`/`atomic.commit`) to any watched key, fires again.
-4. Fires the full set of current values for ALL watched keys (not just the changed one).
-5. Errors from watcher callbacks are silently caught (store level).
+1. Only one watch per connection; re-watch removes the peer from its old group.
+2. `groupsBySignature` is keyed by ordered encoded keys, so identical
+   subscriptions share one `store.watch()` handle and cached initial/live payload.
+3. The first store callback performs one `JSON.stringify`; joining peers reuse
+   the immutable cached string. A mutation performs one serialization per group
+   and exactly one send attempt per peer.
+4. Atomic multi-key commits arrive once because the store emits one committed
+   batch. Expiry/reset produce tombstones; reset preserves the group.
+5. `sequence` is monotonic within the store process only. It is not a durable
+   replay cursor and may restart after process recovery.
+6. Send policy uses actual UTF-8 event bytes and `peer.getBufferedAmount()`.
+   `-1` means the current event entered the native queue, so it is not retried.
+   While blocked, only the newest later payload is retained and resumed on
+   `drain` or a bounded buffer poll.
+7. Default limits: 32 keys/watch, 2 MiB event, 2 MiB soft buffer, 4 MiB hard
+   buffer, 15 s grace. Code `4008` means slow consumer; `4009` means oversized
+   event. Every value is configurable through `options.watch`.
 
 **Push message format:**
 ```json
@@ -422,7 +461,8 @@ Subscribe to key-change notifications.
 ```json
 { "id": 6, "method": "/kv/unwatch" }
 ```
-Calls `peer.data.watcher.cancel()` and sets watcher to `undefined`.
+Removes the peer from its WatchHub group. The group cancels its store handle and
+drops its cached payload when the last peer leaves.
 
 ### WebSocket Queue Listen
 
@@ -483,14 +523,14 @@ On WebSocket close (via velox `close` event handler):
 
 ```ts
 close(peer) {
-  if (peer.data.watcher) peer.data.watcher.cancel();      // cancel active watch
+  watchHub.close(peer);                                  // remove grouped watch peer
   for (const handle of peer.data.queueListeners.values()) {
     handle.cancel();                                        // cancel all queue listeners
   }
 }
 ```
 
-1. Active watcher (if any) is canceled — removed from store's watch index.
+1. Peer is removed from WatchHub; an empty group cancels its one store watcher.
 2. All queue listeners are canceled — removed from store's listener sets. Dispatch timer may stop if no listeners remain on any connection.
 
 ---
@@ -504,9 +544,9 @@ close(peer) {
 
 ### Watch Internals (store level)
 - `watchIndex: Map<hex-encoded-key, Set<Watcher>>`
-- On mutation → `notifyWatchers(encodedKey)` fires all watchers for that key
-- Each watcher re-fetches ALL watched keys' current values on every fire
-- Errors from individual watcher callbacks are silently caught
+- Store committed batches deduplicate matching watchers and share unchanged-key reads.
+- WatchHub groups identical ordered subscriptions and serializes once per group.
+- Peer sends are independent and every send result participates in backpressure policy.
 
 ### Queue Dispatch Internals (store level)
 - `queueListeners: Map<topic, Set<callback>>`
@@ -546,11 +586,14 @@ Wait, in the actual code:
 ```ts
 app.apply("/kv/*", auth);
 // ... kv routes (behind auth)
-// ... queue routes (NOT behind auth)
+app.apply("/queue/*", auth);
+// ... queue routes with per-action/topic authorization
 // ... ws route (handles own auth)
 ```
 
-The `apply("/kv/*", bearerAuth(...))` only adds auth to routes matching `/kv/*`. Queue routes at `/queue/*` are registered after but don't match the `/kv/*` pattern, so they remain unprotected. This is noted as a gotcha.
+Both route families use the same configured credential set. Do not remove the
+per-handler authorization check: bearer middleware establishes identity, while
+the handler verifies role, key scope, atomic contents, and queue topic.
 
 ---
 
@@ -561,8 +604,8 @@ The `apply("/kv/*", bearerAuth(...))` only adds auth to routes matching `/kv/*`.
 3. WebSocket auth can be via query param `?token=` OR post-connect `auth` RPC. Both are supported.
 4. Only ONE watcher per WebSocket connection — calling `/kv/watch` again cancels the previous.
 5. Queue listeners are per-topic per-connection — calling `/queue/listen` for same topic overwrites. Multiple topics per connection OK.
-6. Queue endpoints (`/queue/*`) are currently NOT behind the auth middleware (only `/kv/*` is). This may be a bug — verify before deploying to production.
-7. `reset()` deletes ALL data and cancels all watchers. Not reversible.
+6. Queue endpoints require auth; scoped queue ack by bare ID is intentionally denied.
+7. `reset()` is admin-only, deletes ALL data, emits reset tombstones, and is not reversible.
 8. The server uses velox internally — `AppServer` has `.printRoutes()` for debugging registered endpoints.
 9. No `/kv/increment` endpoint — the store's `increment()` is not exposed via HTTP/WS. Use `get` + `set` or `atomic()` with version checks for atomic counters.
 10. Value serialization happens at the store level (1-byte sentinel + JSON.stringify → binary blob). The server just passes values through.
