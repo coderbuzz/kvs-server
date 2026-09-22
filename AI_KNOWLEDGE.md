@@ -1,6 +1,6 @@
-<!-- docs: sync from coderbuzz/codex@34f92e9 -->
+<!-- docs: sync from coderbuzz/codex@200be78 -->
 
-# KVS Server — AI Agent Knowledge File
+# KVS Server: AI Agent Knowledge File
 
 **Package:** `@coderbuzz/kvs-server`
 **Purpose:** HTTP REST + WebSocket server wrapper for `@coderbuzz/kvs`. Exposes `KVStore` or `AsyncKVStore` as a network-accessible server.
@@ -16,7 +16,7 @@ Sync:  KVStore("kv.db")  +  createServer(store, opts)  →  AppServer
 Async: AsyncKVStore(...) +  createAsyncServer(store, opts) →  AppServer
 ```
 
-Both return a velox `AppServer` — call `.run()` to start, `.stop()` to stop, `.printRoutes()` to debug.
+Both return a velox `AppServer`: call `.run()` to start, `.stop()` to stop, `.printRoutes()` to debug.
 
 ---
 
@@ -92,9 +92,9 @@ Creates an HTTP server wrapping a sync `KVStore`.
 | `options.port` | `number` | `3000` | HTTP server port |
 | `options.hostname` | `string` | `"0.0.0.0"` | Bind address |
 | `options.accessToken` | `string` | required | Bearer token for auth |
-| `options.readToken` | `string` | — | Read/list/watch credential |
-| `options.writeToken` | `string` | — | Read/write/atomic/queue-enqueue credential |
-| `options.adminToken` | `string` | — | Administrative credential |
+| `options.readToken` | `string` | none | Read/list/watch credential |
+| `options.writeToken` | `string` | none | Read/write/atomic/queue-enqueue credential |
+| `options.adminToken` | `string` | none | Administrative credential |
 | `options.credentials` | `KvsCredential[]` | `[]` | Additional role/scoped credentials |
 | `options.legacyAccessTokenRole` | `"read" \| "write" \| "queue" \| "admin"` | `"admin"` | Role assigned to legacy access token |
 | `options.allowQueryToken` | `boolean` | `true` | Deprecated WS query-token compatibility |
@@ -132,7 +132,7 @@ credentials during migration.
 GET /health
 ```
 - **Auth:** No auth required
-- **Response:** `{ "ok": true, "uptime": 123.456 }` — uptime in seconds from `process.uptime()`
+- **Response:** `{ "ok": true, "uptime": 123.456 }` (uptime in seconds from `process.uptime()`)
 
 ### KV Endpoints (all POST, all authenticated)
 
@@ -177,16 +177,16 @@ Validated by veta: `key` must be `array(union([string, number, bigint, boolean, 
 #### `POST /kv/list`
 
 ```json
-// Request — prefix
+// Request: prefix
 { "prefix": ["users"] }
 
-// Request — range
+// Request: range
 { "start": ["events", 1000], "end": ["events", 2000] }
 
-// Request — paginated
+// Request: paginated
 { "prefix": ["logs"], "limit": 20, "cursor": "Abc..." }
 
-// Request — reverse
+// Request: reverse
 { "prefix": ["logs"], "limit": 5, "reverse": true }
 
 // Response
@@ -389,7 +389,7 @@ production to avoid URL logging.
 { "id": 1, "error": "Error message" }
 ```
 
-**Server → Client (push — unsolicited, no `id`):**
+**Server → Client (push: unsolicited, no `id`):**
 ```json
 { "type": "watch", "entries": [...], "sequence": 42, "reset": false }
 { "type": "queue", "topic": "...", "message": {...} }
@@ -407,15 +407,15 @@ production to avoid URL logging.
 | `/kv/atomic` | `{ checks?, mutations?, enqueues? }` | `KvCommitResult \| { ok: false }` |
 | `/kv/reset` | `{}` | `{ ok: true }` |
 | `/kv/clean-expired` | `{}` | `{ ok: true, deleted }` |
-| `/kv/watch` | `{ keys: KvKey[] }` | (no direct response — push events) |
+| `/kv/watch` | `{ keys: KvKey[] }` | (no direct response, push events) |
 | `/kv/unwatch` | `{}` | (no response) |
 | `/queue/enqueue` | `{ payload, topic?, delay?, maxAttempts? }` | `{ ok: true, id }` |
 | `/queue/dequeue` | `{ topic?, limit? }` | `{ messages: QueueMessage[] }` |
 | `/queue/ack` | `{ id }` | `{ ok: boolean }` |
-| `/queue/listen` | `{ topic }` | (no direct response — push events) |
+| `/queue/listen` | `{ topic }` | (no direct response, push events) |
 | `/queue/unlisten` | `{ topic }` | (no response) |
 
-Note: No `/kv/increment` endpoint — increment is a store-level operation. Use `/kv/get` + `/kv/set` or `/kv/atomic` with version checks for atomic counters.
+Note: No `/kv/increment` endpoint. Increment is a store-level operation. Use `/kv/get` + `/kv/set` or `/kv/atomic` with version checks for atomic counters.
 
 ### WebSocket Watch
 
@@ -475,7 +475,7 @@ Push-based queue message delivery with work-stealing (round-robin).
 - `topic` defaults to `"default"` if omitted (`params.topic ?? "default"`).
 
 **Behavior:**
-1. One listener per topic per connection — calling again for the same topic cancels the previous via `peer.data.queueListeners.get(topic)?.cancel()`.
+1. One listener per topic per connection. Calling again for the same topic cancels the previous via `peer.data.queueListeners.get(topic)?.cancel()`.
 2. Multiple topics per connection supported simultaneously (stored in `peer.data.queueListeners` Map).
 3. Messages dispatched every 1s via round-robin across all listeners for the topic (store-level).
 4. Callback fires for each dequeued message. Client must `acknowledge()` manually.
@@ -531,16 +531,16 @@ close(peer) {
 ```
 
 1. Peer is removed from WatchHub; an empty group cancels its one store watcher.
-2. All queue listeners are canceled — removed from store's listener sets. Dispatch timer may stop if no listeners remain on any connection.
+2. All queue listeners are canceled, removed from store's listener sets. Dispatch timer may stop if no listeners remain on any connection.
 
 ---
 
 ## Internal Behavior
 
-### Timers (from KVStore/AsyncKVStore — started in constructor, stopped on close())
-- **TTL cleanup:** Every 60s — deletes rows where `expires_at <= now`
-- **Failed message requeue:** Every 60s — requeues messages where `deliver_at <= now` AND `attempts < maxAttempts` AND status is not "done" (older than 30s)
-- **Queue dispatch:** Every 1s — dispatches deliverable messages to active listeners (round-robin)
+### Timers (from KVStore/AsyncKVStore, started in constructor, stopped on close())
+- **TTL cleanup:** Every 60s: deletes rows where `expires_at <= now`
+- **Failed message requeue:** Every 60s: requeues messages where `deliver_at <= now` AND `attempts < maxAttempts` AND status is not "done" (older than 30s)
+- **Queue dispatch:** Every 1s: dispatches deliverable messages to active listeners (round-robin)
 
 ### Watch Internals (store level)
 - `watchIndex: Map<hex-encoded-key, Set<Watcher>>`
@@ -550,7 +550,7 @@ close(peer) {
 
 ### Queue Dispatch Internals (store level)
 - `queueListeners: Map<topic, Set<callback>>`
-- `queueRRIndex: Map<topic, number>` — round-robin index
+- `queueRRIndex: Map<topic, number>` (round-robin index)
 - `dispatchToListeners()`: dequeues one message at a time, distributes round-robin
 - Timer starts on first listener, stops when all topics have no listeners
 
@@ -574,13 +574,13 @@ enqueue → pending → (dequeue by dispatch or manual) → processing
 
 Routes are registered in this order:
 
-1. `GET /health` — unprotected
-2. `app.apply("/kv/*", bearerAuth({ token }))` — auth middleware for all `/kv/*`
+1. `GET /health`: unprotected
+2. `app.apply("/kv/*", bearerAuth({ token }))`: auth middleware for all `/kv/*`
 3. All KV POST endpoints: `/kv/get`, `/kv/set`, `/kv/delete`, `/kv/list`, `/kv/atomic`, `/kv/reset`, `/kv/clean-expired`
 4. Queue POST endpoints: `/queue/enqueue`, `/queue/dequeue`, `/queue/ack`
 5. WebSocket: `app.ws("/ws", { upgrade, message, close })`
 
-Auth is applied via `app.apply("/kv/*", auth)` which velox handles per-route. Queue routes do NOT have auth applied — they are registered BEFORE the auth middleware is applied (actually after, but the apply only targets `/kv/*` pattern).
+Auth is applied via `app.apply("/kv/*", auth)` which velox handles per-route. Queue routes do NOT have auth applied. They are registered BEFORE the auth middleware is applied (actually after, but the apply only targets `/kv/*` pattern).
 
 Wait, in the actual code:
 ```ts
@@ -599,14 +599,14 @@ the handler verifies role, key scope, atomic contents, and queue topic.
 
 ## Gotchas
 
-1. `accessToken` is required in options — no default. Auth failures return 401.
+1. `accessToken` is required in options. No default. Auth failures return 401.
 2. `createServer()` → sync store, `createAsyncServer()` → async store. Wrong pairing will cause runtime errors (sync method called as async, etc.).
 3. WebSocket auth can be via query param `?token=` OR post-connect `auth` RPC. Both are supported.
-4. Only ONE watcher per WebSocket connection — calling `/kv/watch` again cancels the previous.
-5. Queue listeners are per-topic per-connection — calling `/queue/listen` for same topic overwrites. Multiple topics per connection OK.
+4. Only ONE watcher per WebSocket connection. Calling `/kv/watch` again cancels the previous.
+5. Queue listeners are per-topic per-connection. Calling `/queue/listen` for same topic overwrites. Multiple topics per connection OK.
 6. Queue endpoints require auth; scoped queue ack by bare ID is intentionally denied.
 7. `reset()` is admin-only, deletes ALL data, emits reset tombstones, and is not reversible.
-8. The server uses velox internally — `AppServer` has `.printRoutes()` for debugging registered endpoints.
-9. No `/kv/increment` endpoint — the store's `increment()` is not exposed via HTTP/WS. Use `get` + `set` or `atomic()` with version checks for atomic counters.
+8. The server uses velox internally: `AppServer` has `.printRoutes()` for debugging registered endpoints.
+9. No `/kv/increment` endpoint. The store's `increment()` is not exposed via HTTP/WS. Use `get` + `set` or `atomic()` with version checks for atomic counters.
 10. Value serialization happens at the store level (1-byte sentinel + JSON.stringify → binary blob). The server just passes values through.
-11. TTL cleanup and message requeue timers run within the KVStore/AsyncKVStore instance — started in constructor, stopped on `.close()`. Not managed by the server layer.
+11. TTL cleanup and message requeue timers run within the KVStore/AsyncKVStore instance, started in constructor, stopped on `.close()`. Not managed by the server layer.
