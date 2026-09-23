@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@200be78 -->
+<!-- docs: sync from coderbuzz/codex@b37bd48 -->
 
 # KVS Server: `@coderbuzz/kvs-server`
 
@@ -13,7 +13,7 @@
   <a href="https://codecov.io/gh/coderbuzz/kvs-server"><img src="https://codecov.io/gh/coderbuzz/kvs-server/graph/badge.svg" alt="Codecov" /></a>
 </p>
 
-KVS Server wraps `@coderbuzz/kvs` (`KVStore` or `AsyncKVStore`) into a production-ready HTTP server built on [velox](https://github.com/coderbuzz/velox) (uWebSockets.js). Handles authentication, routing, WebSocket upgrade, and protocol translation. Pair with `@coderbuzz/kvs-client` for the TypeScript client SDK.
+KVS Server wraps `@coderbuzz/kvs` (`KVStore` or `AsyncKVStore`) into a production-ready HTTP server built on [velox](https://github.com/coderbuzz/velox) (served through `Bun.serve` when running on Bun). Handles authentication, routing, WebSocket upgrade, and protocol translation. Pair with `@coderbuzz/kvs-client` for the TypeScript client SDK.
 
 ---
 
@@ -52,17 +52,17 @@ KVS Server transport overhead vs direct KVStore access (Apple M-series, Bun):
 | set('k','v') | **158,732 ops/s** | 53,999 ops/s (2.9x) | 19,433 ops/s (8.2x) |
 | get('k'), hit | **1,160,021 ops/s** | 55,723 ops/s (20.8x) | 24,973 ops/s (46.4x) |
 
-HTTP REST overhead includes JSON serialization, TCP round-trip, and uWebSockets routing (~2-8x slower than direct). WebSocket RPC amortizes connection overhead and is ~2x faster than REST for writes and ~2x for reads.
+HTTP REST overhead includes JSON serialization, TCP round-trip, and velox routing (8-46x slower than direct in the table above). WebSocket RPC amortizes connection overhead and is ~2.8x faster than REST for writes and ~2.2x for reads.
 
 ---
 
 ## Installation
 
 ```sh
-npm install @coderbuzz/kvs @coderbuzz/kvs-server
+npm install @coderbuzz/kvs @coderbuzz/velox @coderbuzz/kvs-server
 ```
 
-KVS Server requires `@coderbuzz/kvs` as a peer (the store engine).
+KVS Server has two peer dependencies: `@coderbuzz/kvs` (the store engine) and `@coderbuzz/velox` (the HTTP/WS framework). `@coderbuzz/veta` (request validation) is a regular dependency and installs automatically.
 
 ---
 
@@ -125,7 +125,7 @@ Creates an HTTP server with REST + WebSocket endpoints wrapping a sync `KVStore`
 | `options.hostname` | `string` | `"0.0.0.0"` | Bind address |
 | `options.accessToken` | `string` | required | Bearer token for auth |
 | `options.readToken` | `string` | none | Read/list/watch-only credential |
-| `options.writeToken` | `string` | none | Read/write/atomic/publish credential |
+| `options.writeToken` | `string` | none | Read/write/atomic/queue-enqueue credential |
 | `options.adminToken` | `string` | none | Administrative credential |
 | `options.credentials` | `KvsCredential[]` | `[]` | Role credentials with key/topic scopes |
 | `options.legacyAccessTokenRole` | `KvsRole` | `"admin"` | Compatibility role for `accessToken` |
@@ -152,6 +152,7 @@ Same interface as `createServer` but accepts `AsyncKVStore` instead of `KVStore`
 | `options.port` | `number` | `3000` | HTTP server port |
 | `options.hostname` | `string` | `"0.0.0.0"` | Bind address |
 | `options.accessToken` | `string` | required | Bearer token for auth |
+| other options | | | Every other `CreateServerOptions` field (`readToken`, `credentials`, `watch`, ...) applies unchanged |
 
 ---
 
@@ -161,7 +162,9 @@ All endpoints except `GET /health` require: `Authorization: Bearer <ACCESS_TOKEN
 
 Auth middleware protects both `/kv/*` and `/queue/*`. Per-operation role,
 encoded key-prefix, atomic-item, and queue-topic authorization is enforced after
-authentication.
+authentication. A missing or unknown token returns `401` (plain-text body from
+the bearer middleware). A known token without permission returns `403` with
+`{ "error": "Forbidden", "reason": "..." }`.
 
 ### Health
 
@@ -296,7 +299,18 @@ tombstones and remain subscribed. Admin role is required.
 { "ok": true, "deleted": 42 }
 ```
 Manually delete expired KV entries. Returns count of removed rows. Auto-runs every 60s on server.
-Note: response field is `deleted` (keep existing API shape).
+Note: response field is `deleted` (keep existing API shape). Admin role is required.
+
+#### `POST /kv/watch-stats`
+
+```json
+// Request
+{}
+
+// Response
+{ "store": { "activeWatchers": 1, "committedBatches": 10, ... }, "server": { "groups": 1, "peers": 3, ... } }
+```
+Returns core watch counters (`KvWatchDiagnostics`) and WatchHub counters (`WatchHubDiagnostics`). Admin role is required.
 
 ### Queue Endpoints (all POST)
 
@@ -338,7 +352,7 @@ Note: response field is `deleted` (keep existing API shape).
 }
 ```
 - `topic` default: `"default"`, `limit` default: `1`.
-- Messages moved to `"processing"` status. Not acked within 30s → auto-requeued (up to `maxAttempts`).
+- Messages moved to `"processing"` status. Unacked messages are requeued by the store's 60 s timer once `deliverAt` is more than 30 s old (up to `maxAttempts`).
 
 #### `POST /queue/ack`
 
@@ -361,8 +375,8 @@ Uses JSON-RPC format. All methods mirror their REST counterparts. Server default
 
 | Setting | Value |
 |---|---|
-| `maxPayloadLength` | 4 MB |
-| `backpressureLimit` | 4 MB |
+| `maxPayloadLength` | 4 MiB (`options.maxPayloadLength`) |
+| `backpressureLimit` | 4 MiB (`options.watch.hardBufferBytes`) |
 | `pingInterval` | 30 s |
 | `pongTimeout` | 10 s |
 | `idleTimeout` | 120 s |
@@ -388,7 +402,8 @@ ws://host:port/ws?token=ACCESS_TOKEN
 ```
 - If token matches → connection upgraded with the resolved principal
 - If token wrong → rejected with HTTP 401 `"Unauthorized"`
-- If no `?token=` → connection must authenticate with Mode 2 within the configured timeout
+- If `allowQueryToken: false` and `?token=` is present → rejected with HTTP 401 `"Query token authentication is disabled"`
+- If no `?token=` → connection must authenticate with Mode 2 within `authTimeoutMs`, otherwise it is closed with code 4001 `authentication_timeout`
 - Set `allowQueryToken: false` in production so credentials do not enter URL/proxy logs.
 
 **Mode 2: Post-connect RPC auth**
@@ -400,7 +415,7 @@ ws://host:port/ws?token=ACCESS_TOKEN
 { "id": 1, "result": { "ok": true } }
 ```
 - If wrong token → `{ "id": 1, "error": "Unauthorized" }` + connection closed (code 4001)
-- If any non-auth method sent before auth → `{ "id": 1, "error": "Unauthorized" }` + connection closed
+- If any non-auth method sent before auth → `{ "id": 1, "error": "Unauthorized" }` + connection closed (code 4001)
 
 ### Message Format (JSON-RPC style)
 
@@ -421,7 +436,7 @@ ws://host:port/ws?token=ACCESS_TOKEN
 
 **Server → Client (push: unsolicited, no `id`):**
 ```json
-{ "type": "watch", "entries": [...], "sequence": 42 }
+{ "type": "watch", "entries": [...], "sequence": 42 }   // "reset": true is added only for reset tombstones
 { "type": "queue", "topic": "...", "message": {...} }
 ```
 
@@ -442,8 +457,9 @@ ws://host:port/ws?token=ACCESS_TOKEN
 | `/queue/enqueue` | `{ payload, topic?, delay?, maxAttempts? }` | `{ ok: true, id }` |
 | `/queue/dequeue` | `{ topic?, limit? }` | `{ messages: QueueMessage[] }` |
 | `/queue/ack` | `{ id }` | `{ ok: boolean }` |
-| `/queue/listen` | `{ topic }` | (no response, push events follow) |
-| `/queue/unlisten` | `{ topic }` | (no response) |
+| `/queue/listen` | `{ topic? }` (default `"default"`) | (no response, push events follow) |
+| `/queue/unlisten` | `{ topic? }` | (no response) |
+| `/debug/watch-stats` | `{}` | `{ store: KvWatchDiagnostics, server: WatchHubDiagnostics }` (admin) |
 
 ### Watch
 
@@ -459,7 +475,8 @@ Subscribe to key-change notifications:
   "entries": [
     { "key": ["config", "theme"], "value": "dark", "version": 3 },
     { "key": ["config", "lang"], "value": "en", "version": 1 }
-  ]
+  ],
+  "sequence": 7
 }
 
 // Unsubscribe
@@ -506,7 +523,7 @@ Push-based queue message delivery with work-stealing (round-robin):
 **Behavior:**
 - One listener per topic per connection. Calling again for same topic overwrites.
 - Multiple topics per connection supported simultaneously.
-- Messages dispatched every 1s via round-robin across all connected listeners for the topic.
+- Messages are dispatched round-robin across all connected listeners for the topic: immediately on listen and on non-delayed enqueue, and by a 1 s timer for delayed, requeued, and atomic-enqueued messages.
 - Callback fires for each dequeued message. Client must `acknowledge()` manually.
 
 ### Error Handling
@@ -517,6 +534,8 @@ Push-based queue message delivery with work-stealing (round-robin):
 | Invalid JSON / parse failure (with `id`) | `{ "id": N, "error": "<message>" }` |
 | Invalid JSON without `id` | `{ "error": "Invalid message" }` |
 | Handler errors (caught) | `{ "id": N, "error": "<error message>" }` |
+| Handler error for a message without `id` | `{ "error": "Invalid message" }` |
+| Authorization denied | `{ "id": N, "error": "Forbidden: <reason>" }` (`id` omitted if the request had none) |
 
 ### Connection Cleanup
 
@@ -531,20 +550,20 @@ On WebSocket close:
 ```
 enqueue → pending
    ↓ (timer or manual dequeue)
-processing → (acknowledge) → done (deleted)
-   ↓ not acked within 30s
+processing → (acknowledge) → done
+   ↓ not acked, deliverAt older than 30s at a 60s tick
 requeue → pending (up to maxAttempts)
 ```
 
 - **TTL cleanup:** Every 60s: deletes rows where `expires_at <= now`
-- **Failed message requeue:** Every 60s: requeues messages older than 30s with `attempts < maxAttempts`
+- **Failed message requeue:** Every 60s: requeues `processing` messages whose `deliverAt` is older than 30s and `attempts < maxAttempts`
 - **Queue dispatch:** Every 1s: dispatches deliverable messages to active listeners
 
 ---
 
 ## Gotchas
 
-1. `accessToken` is required. No default. Auth failures return 401.
+1. `accessToken` is required. No default. Unknown tokens return 401; known tokens without permission return 403.
 2. `createServer()` → sync `KVStore`, `createAsyncServer()` → async `AsyncKVStore`. Wrong pairing causes runtime errors.
 3. Query token auth is retained for compatibility but should be disabled with `allowQueryToken: false` in production.
 4. Only ONE watcher per WebSocket connection. Calling `/kv/watch` again cancels the previous.
@@ -552,7 +571,7 @@ requeue → pending (up to maxAttempts)
 6. Both `/kv/*` and `/queue/*` require authentication. Authorization is applied again per operation, key prefix, and queue topic.
 7. `reset()` is admin-only, deletes ALL data, and emits reset tombstones while preserving active watches. It is not reversible.
 8. The server uses velox internally: `AppServer` has `.printRoutes()` for debugging registered endpoints.
-9. TTL cleanup and message requeue timers run within the KVStore instance, not the server. They start on store construction, stop on store `.close()`.
+9. TTL cleanup and message requeue timers run within the KVStore instance, not the server. `KVStore` starts them on construction, `AsyncKVStore` on its first operation; both stop on store `.close()`.
 10. No `increment` HTTP/WS endpoint. Increment is a store-level operation, not exposed as a separate RPC. Use `get` + `set` or `atomic()` for counters.
 
 ### Watch benchmark harness
