@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@b37bd48 -->
+<!-- docs: sync from coderbuzz/codex@70f6ace -->
 
 # KVS Server: AI Agent Knowledge File
 
@@ -235,6 +235,7 @@ Validated by veta: `key` must be `array(union([string, number, bigint, boolean, 
 ```
 - All fields optional: `prefix`, `start`, `end`, `limit` (min 1), `cursor`, `reverse`.
 - `cursor` is base64-encoded exclusive start key for pagination. `null` = no more pages.
+- `400 { "error": "Bad Request", "reason": "kvs: ..." }` when kvs rejects the options: a `cursor` outside the requested `prefix`/range (a scoped credential cannot page out of its prefix with a forged cursor), or a `limit` that is not an integer ≥ 1 (e.g. `2.5`). Before this release, with kvs ≤ 0.3.1, the forged cursor returned other prefixes' entries with 200, and `limit: 2.5` was a 500. Over WS RPC the same case replies `{ "id": n, "error": "RangeError: kvs: ..." }`.
 - Default `limit` on store side: 100, max 1000.
 
 #### `POST /kv/atomic`

@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@b37bd48 -->
+<!-- docs: sync from coderbuzz/codex@70f6ace -->
 
 # KVS Server: `@coderbuzz/kvs-server`
 
@@ -243,6 +243,7 @@ GET /health
 ```
 - `cursor` is base64-encoded exclusive start key for pagination. `null` = no more pages.
 - Default `limit`: 100, max 1000.
+- An invalid `cursor` (outside the requested prefix or range) or `limit` returns `400 { "error": "Bad Request", "reason": "..." }`.
 
 #### `POST /kv/atomic`
 
