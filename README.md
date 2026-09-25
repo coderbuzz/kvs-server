@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@70f6ace -->
+<!-- docs: sync from coderbuzz/codex@15d78e0 -->
 
 # KVS Server: `@coderbuzz/kvs-server`
 
@@ -34,7 +34,7 @@ KVS Server wraps `@coderbuzz/kvs` (`KVStore` or `AsyncKVStore`) into a productio
 - **Scoped bearer auth**: read/write/queue/admin roles with encoded key-prefix and queue-topic scopes
 - **Grouped WebSocket watch**: one store watch and serialization per identical ordered subscription
 - **Backpressure control**: bounded buffers, latest-state coalescing, drain recovery, and structured slow-consumer closes
-- **Push-based queue**: work-stealing distribution across connected listeners
+- **Push-based queue**: leased messages with ack tokens, per-listener concurrency, nack/retry, dead letters and stats
 - **Health checks**: unauthenticated `/health` endpoint
 - **Dual backend**: `createServer()` for sync `KVStore`, `createAsyncServer()` for async `AsyncKVStore` (PostgreSQL, async SQLite)
 - **Request validation**: all endpoints validated via `@coderbuzz/veta`
@@ -111,6 +111,16 @@ process.on("SIGINT", async () => {
 ```
 
 ---
+
+## Upgrading from kvs-server 4
+
+kvs-server 5 needs `@coderbuzz/kvs` 0.4. The queue protocol changed:
+
+- `/queue/ack` takes `{ id, token }`; `token` comes with every dequeued or pushed message.
+- A WebSocket listener pushes at most `concurrency` (default 1) messages until they are acked or nacked. kvs-server 4 pushed and forgot, so every message was out at once and nothing was retried until the store's timer.
+- New routes: `/queue/nack`, `/queue/extend`, `/queue/dead`, `/queue/retry-dead`, `/queue/delete-dead`, `/queue/stats`.
+- A topic-scoped queue credential can now ack (with the token).
+- A body that fails its schema is a `400`, not a `500`.
 
 ## API
 
@@ -309,11 +319,16 @@ Note: response field is `deleted` (keep existing API shape). Admin role is requi
 {}
 
 // Response
-{ "store": { "activeWatchers": 1, "committedBatches": 10, ... }, "server": { "groups": 1, "peers": 3, ... } }
+{ "store": { "activeWatchers": 1, "committedBatches": 10, ... }, "server": { "groups": 1, "peers": 3, ... }, "queue": { "listeners": 2, "inFlight": 1, "delivered": 40, ... } }
 ```
-Returns core watch counters (`KvWatchDiagnostics`) and WatchHub counters (`WatchHubDiagnostics`). Admin role is required.
+Returns core watch counters (`KvWatchDiagnostics`), WatchHub counters (`WatchHubDiagnostics`) and the store's queue listener counters (`KvQueueDiagnostics`). Admin role is required.
 
 ### Queue Endpoints (all POST)
+
+A dequeued message is **leased**: it carries a `token`, and only that token can
+ack, nack or extend it. If it is neither acked nor nacked before `lockedUntil`,
+it is delivered again; after `maxAttempts` deliveries it is dead-lettered. Invalid
+arguments (a fractional `limit`, `maxAttempts: 0`, an empty token) are a `400`.
 
 #### `POST /queue/enqueue`
 
@@ -329,13 +344,13 @@ Returns core watch counters (`KvWatchDiagnostics`) and WatchHub counters (`Watch
 // Response
 { "ok": true, "id": 1 }
 ```
-- `topic` default: `"default"`, `delay` default: `0`, `maxAttempts` default: `3`.
+- `topic` default: `"default"`, `delay` default: `0`, `maxAttempts` default: `3` (integer >= 1).
 
 #### `POST /queue/dequeue`
 
 ```json
 // Request
-{ "topic": "emails", "limit": 10 }
+{ "topic": "emails", "limit": 10, "visibilityTimeout": 60000 }
 
 // Response
 {
@@ -346,25 +361,51 @@ Returns core watch counters (`KvWatchDiagnostics`) and WatchHub counters (`Watch
       "payload": { "to": "user@example.com" },
       "enqueuedAt": 1700000000000,
       "deliverAt": 1700000005000,
-      "attempts": 0,
-      "maxAttempts": 5
+      "attempts": 1,
+      "maxAttempts": 5,
+      "token": "3f0c6c1e-8a1d-4a51-9a53-2b6f4c7d9e10",
+      "lockedUntil": 1700000035000,
+      "lastError": null
     }
   ]
 }
 ```
-- `topic` default: `"default"`, `limit` default: `1`.
-- Messages moved to `"processing"` status. Unacked messages are requeued by the store's 60 s timer once `deliverAt` is more than 30 s old (up to `maxAttempts`).
+- `topic` default: `"default"`, `limit` default: `1` (max 1000), `visibilityTimeout` default: the store's (30 s).
 
 #### `POST /queue/ack`
 
 ```json
-// Request
-{ "id": 1 }
-
-// Response
-{ "ok": true }
+{ "id": 1, "token": "3f0c6c1e-..." }   →   { "ok": true }
 ```
-Returns `"ok": false` if message not found or already processed.
+Deletes the message (or keeps it as `done` under the store's `doneRetention`). `"ok": false` when the lease is no longer held under that token.
+
+#### `POST /queue/nack`
+
+```json
+{ "id": 1, "token": "3f0c6c1e-...", "error": "SMTP 451", "delay": 10000 }   →   { "ok": true }
+```
+Retry after `delay` ms (default: the store's backoff), or dead-letter on the last attempt. `error` becomes `lastError`.
+
+#### `POST /queue/extend`
+
+```json
+{ "id": 1, "token": "3f0c6c1e-...", "visibilityTimeout": 60000 }   →   { "ok": true }
+```
+The lease now ends `visibilityTimeout` ms from now; `0` hands the message back.
+
+#### `POST /queue/dead`, `/queue/retry-dead`, `/queue/delete-dead`
+
+```json
+{ "topic": "emails", "limit": 100, "after": 0 }   →   { "messages": [{ "id": 1, …, "lastError": "SMTP 451", "failedAt": 1700000100000 }] }
+{ "topic": "emails", "id": 1 }                    →   { "count": 1 }      // omit id: every dead message of the topic
+```
+
+#### `POST /queue/stats`
+
+```json
+{ "topic": "emails" }   →   { "stats": [{ "topic": "emails", "pending": 3, "delayed": 1, "processing": 2, "dead": 0, "done": 0, "oldestPendingAt": 1700000000000 }] }
+```
+Omit `topic` for every topic (unscoped credentials only).
 
 ---
 
@@ -456,11 +497,19 @@ ws://host:port/ws?token=ACCESS_TOKEN
 | `/kv/watch` | `{ keys: KvKey[] }` | (no response, push events follow) |
 | `/kv/unwatch` | `{}` | (no response) |
 | `/queue/enqueue` | `{ payload, topic?, delay?, maxAttempts? }` | `{ ok: true, id }` |
-| `/queue/dequeue` | `{ topic?, limit? }` | `{ messages: QueueMessage[] }` |
-| `/queue/ack` | `{ id }` | `{ ok: boolean }` |
+| `/queue/dequeue` | `{ topic?, limit?, visibilityTimeout? }` | `{ messages: QueueMessage[] }` |
+| `/queue/ack` | `{ id, token }` | `{ ok: boolean }` |
+| `/queue/nack` | `{ id, token, error?, delay? }` | `{ ok: boolean }` |
+| `/queue/extend` | `{ id, token, visibilityTimeout? }` | `{ ok: boolean }` |
+| `/queue/dead` | `{ topic?, limit?, after? }` | `{ messages: QueueDeadMessage[] }` |
+| `/queue/retry-dead` | `{ topic?, id? }` | `{ count }` |
+| `/queue/delete-dead` | `{ topic?, id? }` | `{ count }` |
+| `/queue/stats` | `{ topic? }` | `{ stats: QueueStats[] }` |
+| `/queue/listen` | `{ topic?, concurrency?, visibilityTimeout? }` (topic default `"default"`) | (no response, push events follow) |
+| `/queue/unlisten` | `{ topic? }` | (no response) |
 | `/queue/listen` | `{ topic? }` (default `"default"`) | (no response, push events follow) |
 | `/queue/unlisten` | `{ topic? }` | (no response) |
-| `/debug/watch-stats` | `{}` | `{ store: KvWatchDiagnostics, server: WatchHubDiagnostics }` (admin) |
+| `/debug/watch-stats` | `{}` | `{ store: KvWatchDiagnostics, server: WatchHubDiagnostics, queue: KvQueueDiagnostics }` (admin) |
 
 ### Watch
 
@@ -496,36 +545,32 @@ Subscribe to key-change notifications:
 
 ### Queue Listen
 
-Push-based queue message delivery with work-stealing (round-robin):
-
 ```json
-// Subscribe
-{ "id": 7, "method": "/queue/listen", "params": { "topic": "emails" } }
+// Subscribe: at most 4 unacked messages at a time
+{ "id": 7, "method": "/queue/listen", "params": { "topic": "emails", "concurrency": 4 } }
 
 // Push event
 {
   "type": "queue",
   "topic": "emails",
-  "message": {
-    "id": 1,
-    "topic": "emails",
-    "payload": { "to": "user@example.com" },
-    "enqueuedAt": 1700000000000,
-    "deliverAt": 1700000000000,
-    "attempts": 1,
-    "maxAttempts": 3
-  }
+  "message": { "id": 1, "topic": "emails", "payload": { "to": "user@example.com" }, "attempts": 1, "maxAttempts": 3,
+               "token": "3f0c6c1e-...", "lockedUntil": 1700000030000, "lastError": null, "enqueuedAt": 1700000000000, "deliverAt": 1700000000000 }
 }
 
+// Finish it
+{ "id": 8, "method": "/queue/ack", "params": { "id": 1, "token": "3f0c6c1e-..." } }
+
 // Unsubscribe
-{ "id": 8, "method": "/queue/unlisten", "params": { "topic": "emails" } }
+{ "id": 9, "method": "/queue/unlisten", "params": { "topic": "emails" } }
 ```
 
 **Behavior:**
-- One listener per topic per connection. Calling again for same topic overwrites.
+- One listener per topic per connection. Calling again for same topic replaces it.
 - Multiple topics per connection supported simultaneously.
-- Messages are dispatched round-robin across all connected listeners for the topic: immediately on listen and on non-delayed enqueue, and by a 1 s timer for delayed, requeued, and atomic-enqueued messages.
-- Callback fires for each dequeued message. Client must `acknowledge()` manually.
+- The server pushes at most `concurrency` (default 1, max 1000) messages and then **waits**: a slot frees when the client acks or nacks the message (over this socket or HTTP), when its lease ends, or when the connection closes. `@coderbuzz/kvs-client` acks when the handler resolves and nacks when it throws.
+- Listeners on other connections (and other processes on the same database) share the topic: whoever has a free slot gets the next message.
+- New messages are pushed at once, including ones from `/kv/atomic`; delayed messages, retries and expired leases within a second.
+- Closing the connection hands its unacked messages back at once (their leases are released), so another listener gets them.
 
 ### Error Handling
 
@@ -542,23 +587,22 @@ Push-based queue message delivery with work-stealing (round-robin):
 
 On WebSocket close:
 1. The peer is removed from its WatchHub group; the shared store watcher is canceled when its last peer leaves.
-2. All queue listeners are canceled (removed from listener sets). Dispatch timer may stop if no listeners remain.
+2. All queue listeners are canceled, and the leases of messages pushed to this connection but not yet acked are released, so they are delivered again at once.
 
 ---
 
 ## Message Lifecycle (Server-Side)
 
 ```
-enqueue → pending
-   ↓ (timer or manual dequeue)
-processing → (acknowledge) → done
-   ↓ not acked, deliverAt older than 30s at a 60s tick
-requeue → pending (up to maxAttempts)
+enqueue → pending ──dequeue / push──▶ processing (leased) ──ack──▶ deleted (or done)
+             ▲                           │
+             └── nack, or lease expired ─┤  (retried after the backoff)
+                                         └── last attempt failed ──▶ dead ── retry-dead ─▶ pending
 ```
 
-- **TTL cleanup:** Every 60s: deletes rows where `expires_at <= now`
-- **Failed message requeue:** Every 60s: requeues `processing` messages whose `deliverAt` is older than 30s and `attempts < maxAttempts`
-- **Queue dispatch:** Every 1s: dispatches deliverable messages to active listeners
+- **TTL cleanup and queue maintenance:** every 60s in the store (expired entries, leases that expired on their last attempt, retention of `done`/`dead`).
+- **Expired leases** go back to pending before the store's next dequeue (at most once a second).
+- **Listener poll:** every 1s while listeners exist.
 
 ---
 
@@ -568,11 +612,11 @@ requeue → pending (up to maxAttempts)
 2. `createServer()` → sync `KVStore`, `createAsyncServer()` → async `AsyncKVStore`. Wrong pairing causes runtime errors.
 3. Query token auth is retained for compatibility but should be disabled with `allowQueryToken: false` in production.
 4. Only ONE watcher per WebSocket connection. Calling `/kv/watch` again cancels the previous.
-5. Queue listeners are per-topic per-connection. Calling `/queue/listen` for same topic overwrites. Multiple topics per connection OK.
+5. Queue listeners are per-topic per-connection. Calling `/queue/listen` for same topic overwrites. Multiple topics per connection OK. A listener waits for the client's ack or nack before pushing more than `concurrency` messages.
 6. Both `/kv/*` and `/queue/*` require authentication. Authorization is applied again per operation, key prefix, and queue topic.
 7. `reset()` is admin-only, deletes ALL data, and emits reset tombstones while preserving active watches. It is not reversible.
 8. The server uses velox internally: `AppServer` has `.printRoutes()` for debugging registered endpoints.
-9. TTL cleanup and message requeue timers run within the KVStore instance, not the server. `KVStore` starts them on construction, `AsyncKVStore` on its first operation; both stop on store `.close()`.
+9. TTL cleanup and queue maintenance timers run within the KVStore instance, not the server. `KVStore` starts them on construction, `AsyncKVStore` on its first operation; both stop on store `.close()`.
 10. No `increment` HTTP/WS endpoint. Increment is a store-level operation, not exposed as a separate RPC. Use `get` + `set` or `atomic()` for counters.
 
 ### Watch benchmark harness
@@ -594,3 +638,4 @@ and network results rather than the example workload.
 ## License
 
 MIT &copy; 2026 Indra Gunawan
+

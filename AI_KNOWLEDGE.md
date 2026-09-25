@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@70f6ace -->
+<!-- docs: sync from coderbuzz/codex@15d78e0 -->
 
 # KVS Server: AI Agent Knowledge File
 
@@ -141,12 +141,12 @@ interface WatchHubOptions {
 |---|---|
 | `read` | get, list, watch |
 | `write` | get, list, watch, set, delete, atomic, queue-enqueue |
-| `queue` | queue-enqueue, queue-dequeue, queue-ack, queue-listen |
+| `queue` | queue-enqueue, queue-dequeue, queue-ack (ack/nack/extend), queue-listen, queue-dead (dead/retry-dead/delete-dead), queue-stats |
 | `admin` | everything, including reset, clean-expired, watch-stats |
 
 - `accessToken`, `readToken`, `writeToken`, `adminToken`, and `credentials[]` are merged into one token map. Empty or duplicate tokens throw at construction.
 - Key scopes compare encoded-key byte prefixes. A scoped `/kv/list` must pass a `prefix` inside an allowed prefix (`start`/`end` ranges are denied).
-- Scoped queue credentials (`queueTopics` set) cannot `/queue/ack`, because ack carries no topic.
+- Scoped queue credentials (`queueTopics` set) may ack/nack/extend: the lease token proves the message came from an allowed topic. They must pass `topic` to `/queue/stats`.
 - `softBufferBytes > hardBufferBytes` throws at construction.
 
 ---
@@ -156,7 +156,7 @@ interface WatchHubOptions {
 All endpoints except `GET /health` require `Authorization: Bearer <TOKEN>`.
 Bearer middleware protects both `/kv/*` and `/queue/*`; every handler then
 authorizes its action, all atomic keys, encoded key prefixes, and queue topics.
-Missing/unknown token → `401` with a plain-text body from velox `bearerAuth`. Known token without permission → `403` `{ "error": "Forbidden", "reason": "..." }`. Body validation failures are rejected by velox/veta before the handler runs.
+Missing/unknown token → `401` with a plain-text body from velox `bearerAuth`. Known token without permission → `403` `{ "error": "Forbidden", "reason": "..." }`. Body validation failures are rejected by veta before the handler runs and answered `400 { "error": "Bad Request", "reason" }` (a 500 before kvs-server 5).
 `accessToken` remains admin by default for compatibility. Use
 `legacyAccessTokenRole: "write"`, a separate `adminToken`, and read/scoped
 credentials during migration.
@@ -304,18 +304,18 @@ Manually delete expired KV entries. Returns count of removed rows. (Auto-runs ev
 // Response
 {
   "store": { "activeWatchers": 1, "committedBatches": 10, "callbacks": 12, "sharedReads": 0, "callbackErrors": 0, "dispatchErrors": 0 },
-  "server": { "groups": 1, "peers": 3, "serializations": 11, "sends": 33, "backpressureEvents": 0, "coalescedEvents": 0, "droppedEvents": 0, "slowConsumerCloses": 0 }
+  "server": { "groups": 1, "peers": 3, "serializations": 11, "sends": 33, "backpressureEvents": 0, "coalescedEvents": 0, "droppedEvents": 0, "slowConsumerCloses": 0 },
+  "queue": { "listeners": 2, "inFlight": 1, "delivered": 40, "acked": 38, "nacked": 1, "handlerErrors": 0, "leaseLost": 0, "dispatchErrors": 0 }
 }
 ```
-Admin-only (`diagnostics` action). `store` is `KvWatchDiagnostics`, `server` is `WatchHubDiagnostics`.
+Admin-only (`diagnostics` action). `store` is `KvWatchDiagnostics`, `server` is `WatchHubDiagnostics`, `queue` is `KvQueueDiagnostics` (listeners of this server's store, WebSocket ones included).
 
-### Queue Endpoints (all POST, authenticated and authorized)
+### Queue Endpoints (all POST)
 
-Bearer authentication is applied to `/queue/*`. Queue roles and optional topic
-allowlists are enforced per operation. Scoped queue credentials cannot
-acknowledge by bare ID because the current protocol does not carry a verifiable
-topic; use an unscoped queue/admin credential for ack until topic-aware ack is
-introduced.
+A dequeued message is **leased**: it carries a `token`, and only that token can
+ack, nack or extend it. If it is neither acked nor nacked before `lockedUntil`,
+it is delivered again; after `maxAttempts` deliveries it is dead-lettered. Invalid
+arguments (a fractional `limit`, `maxAttempts: 0`, an empty token) are a `400`.
 
 #### `POST /queue/enqueue`
 
@@ -331,13 +331,13 @@ introduced.
 // Response
 { "ok": true, "id": 1 }
 ```
-- `topic` default: `"default"`, `delay` default: `0`, `maxAttempts` default: `3`.
+- `topic` default: `"default"`, `delay` default: `0`, `maxAttempts` default: `3` (integer >= 1).
 
 #### `POST /queue/dequeue`
 
 ```json
 // Request
-{ "topic": "emails", "limit": 10 }
+{ "topic": "emails", "limit": 10, "visibilityTimeout": 60000 }
 
 // Response
 {
@@ -348,25 +348,55 @@ introduced.
       "payload": { "to": "user@example.com" },
       "enqueuedAt": 1700000000000,
       "deliverAt": 1700000005000,
-      "attempts": 0,
-      "maxAttempts": 5
+      "attempts": 1,
+      "maxAttempts": 5,
+      "token": "3f0c6c1e-8a1d-4a51-9a53-2b6f4c7d9e10",
+      "lockedUntil": 1700000035000,
+      "lastError": null
     }
   ]
 }
 ```
-- `topic` default: `"default"`, `limit` default: `1`.
-- Moves matching messages to `"processing"` status. Unacked messages are requeued by the store's 60 s timer once `deliverAt` is more than 30 s old (up to `maxAttempts`).
+- `topic` default: `"default"`, `limit` default: `1` (max 1000), `visibilityTimeout` default: the store's (30 s).
 
 #### `POST /queue/ack`
 
 ```json
-// Request
-{ "id": 1 }
-
-// Response
-{ "ok": true }
+{ "id": 1, "token": "3f0c6c1e-..." }   →   { "ok": true }
 ```
-- Returns `"ok": false` if message not found or already processed.
+Deletes the message (or keeps it as `done` under the store's `doneRetention`). `"ok": false` when the lease is no longer held under that token.
+
+#### `POST /queue/nack`
+
+```json
+{ "id": 1, "token": "3f0c6c1e-...", "error": "SMTP 451", "delay": 10000 }   →   { "ok": true }
+```
+Retry after `delay` ms (default: the store's backoff), or dead-letter on the last attempt. `error` becomes `lastError`.
+
+#### `POST /queue/extend`
+
+```json
+{ "id": 1, "token": "3f0c6c1e-...", "visibilityTimeout": 60000 }   →   { "ok": true }
+```
+The lease now ends `visibilityTimeout` ms from now; `0` hands the message back.
+
+#### `POST /queue/dead`, `/queue/retry-dead`, `/queue/delete-dead`
+
+```json
+{ "topic": "emails", "limit": 100, "after": 0 }   →   { "messages": [{ "id": 1, …, "lastError": "SMTP 451", "failedAt": 1700000100000 }] }
+{ "topic": "emails", "id": 1 }                    →   { "count": 1 }      // omit id: every dead message of the topic
+```
+
+#### `POST /queue/stats`
+
+```json
+{ "topic": "emails" }   →   { "stats": [{ "topic": "emails", "pending": 3, "delayed": 1, "processing": 2, "dead": 0, "done": 0, "oldestPendingAt": 1700000000000 }] }
+```
+Omit `topic` for every topic (unscoped credentials only).
+
+**Authorization.** `ack`, `nack` and `extend` need the `queue-ack` action but no topic check: the lease token is only handed out by a dequeue from an allowed topic (0.3 refused every ack from a topic-scoped credential). `dead`, `retry-dead` and `delete-dead` are the `queue-dead` action and `stats` is `queue-stats`, both topic-checked; a scoped credential must name a topic for `stats`.
+
+**Validation.** The REST bodies go through veta; a body that fails its schema is a `400 { "error": "Bad Request", "reason": "<veta message>" }` (0.3 answered every schema failure with a 500). kvs's own `RangeError`/`TypeError` (e.g. `limit: 1.5` passes the schema `min: 1` but not the store) are mapped to the same 400 by the queue routes and `/kv/list`.
 
 ---
 
@@ -414,7 +444,10 @@ ws://host:port/ws?token=ACCESS_TOKEN
 ```ts
 {
   principal: AuthPrincipal | null
-  queueListeners: Map<string, { cancel: () => void }>
+  queue: {
+    queueListeners: Map<string, { cancel(): Promise<void> }>  // topic → store listener
+    deliveries: Set<string>                                   // "id:token" pushed, not yet settled
+  }
   authTimer: ReturnType<typeof setTimeout> | null
 }
 ```
@@ -463,11 +496,19 @@ The watch push is built as `{ type, entries, sequence, reset: event.reset || und
 | `/kv/watch` | `{ keys: KvKey[] }` | (no direct response, push events) |
 | `/kv/unwatch` | `{}` | (no response) |
 | `/queue/enqueue` | `{ payload, topic?, delay?, maxAttempts? }` | `{ ok: true, id }` |
-| `/queue/dequeue` | `{ topic?, limit? }` | `{ messages: QueueMessage[] }` |
-| `/queue/ack` | `{ id }` | `{ ok: boolean }` |
+| `/queue/dequeue` | `{ topic?, limit?, visibilityTimeout? }` | `{ messages: QueueMessage[] }` |
+| `/queue/ack` | `{ id, token }` | `{ ok: boolean }` |
+| `/queue/nack` | `{ id, token, error?, delay? }` | `{ ok: boolean }` |
+| `/queue/extend` | `{ id, token, visibilityTimeout? }` | `{ ok: boolean }` |
+| `/queue/dead` | `{ topic?, limit?, after? }` | `{ messages: QueueDeadMessage[] }` |
+| `/queue/retry-dead` | `{ topic?, id? }` | `{ count }` |
+| `/queue/delete-dead` | `{ topic?, id? }` | `{ count }` |
+| `/queue/stats` | `{ topic? }` | `{ stats: QueueStats[] }` |
+| `/queue/listen` | `{ topic?, concurrency?, visibilityTimeout? }` (topic default `"default"`) | (no response, push events follow) |
+| `/queue/unlisten` | `{ topic? }` | (no response) |
 | `/queue/listen` | `{ topic? }` (default `"default"`) | (no direct response, push events) |
 | `/queue/unlisten` | `{ topic? }` | (no response) |
-| `/debug/watch-stats` | `{}` | `{ store: KvWatchDiagnostics, server: WatchHubDiagnostics }` (admin) |
+| `/debug/watch-stats` | `{}` | `{ store: KvWatchDiagnostics, server: WatchHubDiagnostics, queue: KvQueueDiagnostics }` (admin) |
 
 WS RPC params are not schema-validated (only REST bodies go through veta). Invalid params surface as handler errors.
 
@@ -532,19 +573,25 @@ drops its cached payload when the last peer leaves.
 
 ### WebSocket Queue Listen
 
-Push-based queue message delivery with work-stealing (round-robin).
-
 ```json
 // Subscribe (client → server):
-{ "id": 7, "method": "/queue/listen", "params": { "topic": "emails" } }
+{ "id": 7, "method": "/queue/listen", "params": { "topic": "emails", "concurrency": 4, "visibilityTimeout": 60000 } }
 ```
-- `topic` defaults to `"default"` if omitted (`params.topic ?? "default"`).
+- `topic` defaults to `"default"`; `concurrency` (integer 1..1000, default 1) and `visibilityTimeout` are passed to the store listener, which validates them (an invalid value is an RPC error).
 
 **Behavior:**
-1. One listener per topic per connection. Calling again for the same topic cancels the previous via `peer.data.queueListeners.get(topic)?.cancel()`.
-2. Multiple topics per connection supported simultaneously (stored in `peer.data.queueListeners` Map).
-3. Messages dispatched round-robin across all listeners for the topic (store-level): immediately on listen and on non-delayed `/queue/enqueue`, and by the store's 1 s timer for delayed, requeued, and atomic-enqueued messages.
-4. Callback fires for each dequeued message. Client must `acknowledge()` manually.
+- One listener per topic per connection. Calling again for same topic replaces it.
+- Multiple topics per connection supported simultaneously.
+- The server pushes at most `concurrency` (default 1, max 1000) messages and then **waits**: a slot frees when the client acks or nacks the message (over this socket or HTTP), when its lease ends, or when the connection closes. `@coderbuzz/kvs-client` acks when the handler resolves and nacks when it throws.
+- Listeners on other connections (and other processes on the same database) share the topic: whoever has a free slot gets the next message.
+- New messages are pushed at once, including ones from `/kv/atomic`; delayed messages, retries and expired leases within a second.
+- Closing the connection hands its unacked messages back at once (their leases are released), so another listener gets them.
+
+**Implementation (`src/queue-routes.ts`, `QueueBridge`):**
+1. `/queue/listen` calls `store.addQueueListener(topic, handler, { concurrency, visibilityTimeout, autoAck: false })` and keeps the handle in `peer.data.queue.queueListeners` (a second listen for the topic cancels the first).
+2. The handler returns a promise and sends `{ type: "queue", topic, message }`. The promise is stored in a server-wide `Map<"id:token", Delivery>` (and the key in `peer.data.queue.deliveries`) and resolves on: a successful `/queue/ack` or `/queue/nack` with that id+token over any transport; a successful `/queue/extend` with `visibilityTimeout: 0`; a timer at `lockedUntil` (re-armed by `/queue/extend`, whose default length for a pushed message is that delivery's own lease length); the connection closing. While it is pending the store listener holds the slot, so the server never has more than `concurrency` unacked messages out per listener.
+3. `autoAck: false` means the store neither acks nor renews: the client owns the lease (`/queue/extend` for long jobs).
+4. On close: listeners cancelled, each unsettled delivery resolved and its lease released with `extendLease(id, token, 0)`, so the next dequeue (this store: at once; other processes: within 1 s) delivers it again with `attempts + 1`.
 
 **Push message format:**
 ```json
@@ -552,13 +599,10 @@ Push-based queue message delivery with work-stealing (round-robin).
   "type": "queue",
   "topic": "emails",
   "message": {
-    "id": 1,
-    "topic": "emails",
-    "payload": { "to": "user@example.com" },
-    "enqueuedAt": 1700000000000,
-    "deliverAt": 1700000000000,
-    "attempts": 1,
-    "maxAttempts": 3
+    "id": 1, "topic": "emails", "payload": { "to": "user@example.com" },
+    "enqueuedAt": 1700000000000, "deliverAt": 1700000000000,
+    "attempts": 1, "maxAttempts": 3,
+    "token": "3f0c6c1e-8a1d-4a51-9a53-2b6f4c7d9e10", "lockedUntil": 1700000030000, "lastError": null
   }
 }
 ```
@@ -567,7 +611,7 @@ Push-based queue message delivery with work-stealing (round-robin).
 ```json
 { "id": 8, "method": "/queue/unlisten", "params": { "topic": "emails" } }
 ```
-Calls `peer.data.queueListeners.get(topic)?.cancel()` and deletes from Map.
+Cancels the store listener (already pushed messages stay leased until acked, nacked or expired).
 
 ### WebSocket Error Handling
 
@@ -590,15 +634,13 @@ On WebSocket close (via velox `close` event handler):
 ```ts
 close(peer) {
   if (peer.data.authTimer) clearTimeout(peer.data.authTimer);
-  watchHub.close(peer);                                  // remove grouped watch peer
-  for (const handle of peer.data.queueListeners.values()) {
-    handle.cancel();                                        // cancel all queue listeners
-  }
+  watchHub.close(peer);          // remove grouped watch peer
+  queue.close(peer.data.queue);  // cancel listeners, release unacked leases
 }
 ```
 
 1. Peer is removed from WatchHub; an empty group cancels its one store watcher.
-2. All queue listeners are canceled, removed from store's listener sets. Dispatch timer may stop if no listeners remain on any connection.
+2. All queue listeners are canceled; messages pushed to this peer and not settled are released (`extendLease(…, 0)`).
 
 ---
 
@@ -606,9 +648,10 @@ close(peer) {
 
 ### Timers (from KVStore/AsyncKVStore, stopped on close())
 - `KVStore` starts its 60s timer in the constructor; `AsyncKVStore` starts it after the first operation.
-- **TTL cleanup:** Every 60s: deletes rows where `expires_at <= now` and emits tombstones
-- **Failed message requeue:** Every 60s: sets `status = 'pending'` where `status = 'processing' AND attempts < max_attempts AND deliver_at <= now - 30000`
-- **Queue dispatch:** Every 1s while listeners exist: dispatches deliverable messages to active listeners (round-robin)
+- **TTL cleanup + queue maintenance:** every 60s: deletes rows where `expires_at <= now` (tombstones), dead-letters leases that expired on their last attempt, applies `doneRetention`/`deadRetention`.
+- **Lease reclaim:** before a dequeue, at most once a second per store: expired leases with attempts left → pending.
+- **Listener poll:** every 1s while listeners exist (WebSocket listeners included).
+- **Per delivery (server):** one timeout at the message's `lockedUntil` that frees the WebSocket slot.
 
 ### Watch Internals (store level)
 - `watchIndex: Map<hex-encoded-key, Set<Watcher>>`
@@ -617,10 +660,7 @@ close(peer) {
 - Peer sends are independent and every send result participates in backpressure policy.
 
 ### Queue Dispatch Internals (store level)
-- `queueListeners: Map<topic, Set<callback>>`
-- `queueRRIndex: Map<topic, number>` (round-robin index)
-- `dispatchToListeners()`: dequeues one message at a time, distributes round-robin
-- Timer starts on first listener, stops when all topics have no listeners
+- One `QueueWorker` per listener (`@coderbuzz/kvs` `src/queue.ts`): dequeues only while it has a free slot, awaits the handler, notified by enqueue/atomic/retry-dead, a finished handler and the 1 s poll. No round-robin; listeners compete for messages.
 
 ### Value Serialization (store level)
 - Values are stored as binary blobs with a 1-byte sentinel:
@@ -629,11 +669,12 @@ close(peer) {
 
 ### Message Lifecycle
 ```
-enqueue → pending → (dequeue by dispatch or manual) → processing
-                         ↓ not acked, deliverAt older than 30s at a 60s tick
-                      requeue → pending (up to maxAttempts)
-                         ↓ ack'd
-                       done (row kept with status 'done')
+enqueue → pending → (dequeue / push, lease + token) → processing
+   ▲                    │ ack(id, token) → row deleted (status 'done' kept only under doneRetention)
+   ├── nack, attempts < max → pending at now + backoff
+   ├── lease expired, attempts < max → pending (reclaimed before a dequeue)
+   │                    │ nack / lease expiry on the last attempt → dead (lastError, failedAt)
+   └──────── retry-dead ┘
 ```
 
 ---
@@ -642,10 +683,11 @@ enqueue → pending → (dequeue by dispatch or manual) → processing
 
 Routes are registered in this order:
 
+0. `mapValidationErrors(app)` (`src/errors.ts`): `app.onError` answers a `VetaError` with 400 and rethrows everything else to velox's default (logged 500, no error text in the body)
 1. `GET /health`: unprotected
 2. `app.apply("/kv/*", auth)` and `app.apply("/queue/*", auth)`, where `auth = { auth: bearerAuth({ token: verifier.tokens }) }`
 3. KV POST endpoints: `/kv/get`, `/kv/set`, `/kv/delete`, `/kv/list`, `/kv/atomic`
-4. Queue POST endpoints: `/queue/enqueue`, `/queue/dequeue`, `/queue/ack`
+4. Queue POST endpoints: `/queue/enqueue` (route file), then `registerQueueRoutes()` from `queue-routes.ts`: `/queue/dequeue`, `/queue/ack`, `/queue/nack`, `/queue/extend`, `/queue/dead`, `/queue/retry-dead`, `/queue/delete-dead`, `/queue/stats`
 5. Admin KV POST endpoints: `/kv/reset`, `/kv/clean-expired`, `/kv/watch-stats`
 6. WebSocket: `app.ws("/ws", { upgrade, open, message, drain, close }, { maxPayloadLength, backpressureLimit, closeOnBackpressureLimit: true })`
 
@@ -690,11 +732,14 @@ bun run --cwd packages/kvs-server bench:watch -- \
 3. WebSocket auth can be via query param `?token=` OR post-connect `auth` RPC. Both are supported.
 4. Only ONE watcher per WebSocket connection. Calling `/kv/watch` again cancels the previous.
 5. Queue listeners are per-topic per-connection. Calling `/queue/listen` for same topic overwrites. Multiple topics per connection OK.
-6. Queue endpoints require auth; scoped queue ack by bare ID is intentionally denied.
+6. Queue endpoints require auth. ack/nack/extend need the lease token (`400` without it); a wrong or stale token is `{ ok: false }`, not an error.
 7. `reset()` is admin-only, deletes ALL data, emits reset tombstones, and is not reversible.
 8. The server uses velox internally: `AppServer` has `.printRoutes()` for debugging registered endpoints.
 9. No `/kv/increment` endpoint. The store's `increment()` is not exposed via HTTP/WS. Use `get` + `set` or `atomic()` with version checks for atomic counters.
 10. Value serialization happens at the store level (1-byte sentinel + JSON.stringify → binary blob). The server just passes values through.
-11. TTL cleanup and message requeue timers run within the KVStore/AsyncKVStore instance (`KVStore`: started in constructor; `AsyncKVStore`: started on first operation), stopped on `.close()`. Not managed by the server layer.
+11. TTL cleanup and queue maintenance timers run within the KVStore/AsyncKVStore instance (`KVStore`: started in constructor; `AsyncKVStore`: started on first operation), stopped on `.close()`. Not managed by the server layer.
 12. Neither `createServer` nor `app.stop()` closes the store or the WatchHub; close the store yourself on shutdown.
 13. `@coderbuzz/velox` is a peer dependency: install it next to `@coderbuzz/kvs`.
+14. kvs-server 5 needs `@coderbuzz/kvs` ^0.4 (queue v2 store API). A 0.3 store has no `nack`/`listDead`/`queueStats`.
+15. A WebSocket listener with the default `concurrency: 1` processes one message at a time per connection. Raise it for throughput; the client must ack or nack every pushed message, or its slot stays taken until the lease ends.
+16. WS RPC params are not schema-validated; kvs validates the queue arguments itself and the error comes back as `{ id, error }`.
