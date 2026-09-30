@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@15d78e0 -->
+<!-- docs: sync from coderbuzz/codex@e61149f -->
 
 # KVS Server: `@coderbuzz/kvs-server`
 
@@ -111,6 +111,16 @@ process.on("SIGINT", async () => {
 ```
 
 ---
+
+## Upgrading from kvs-server 5
+
+kvs-server 6 needs `@coderbuzz/kvs` 0.5:
+
+- A credential scoped to a key prefix reaches the prefix key itself and its children, not a string sibling that shares its bytes (`["tenant", "a\u0000x"]` for `["tenant", "a"]`).
+- `/kv/list` with `prefix` returns the children only (not the prefix key), `prefix: []` lists every key, and `prefix` with `start`/`end` is a 400.
+- Entry versions are store-wide versionstamps, not 1, 2, 3 per key.
+- A key over 2 KiB encoded, `NaN` in a key, or a value kvs cannot store is a `400`.
+- A stored `bigint` is sent as a decimal string (it used to be impossible to store; JSON has no bigint). `Date`, `Map`, `Set` and `Uint8Array` values go out as `JSON.stringify` writes them.
 
 ## Upgrading from kvs-server 4
 
@@ -253,7 +263,8 @@ GET /health
 ```
 - `cursor` is base64-encoded exclusive start key for pagination. `null` = no more pages.
 - Default `limit`: 100, max 1000.
-- An invalid `cursor` (outside the requested prefix or range) or `limit` returns `400 { "error": "Bad Request", "reason": "..." }`.
+- An invalid `cursor` (outside the requested prefix or range) or `limit`, or `prefix` together with `start`/`end`, returns `400 { "error": "Bad Request", "reason": "..." }`.
+- `prefix` lists the children of the prefix, not the prefix key itself; `prefix: []` lists every key (kvs 0.5).
 
 #### `POST /kv/atomic`
 

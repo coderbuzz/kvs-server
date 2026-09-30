@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@15d78e0 -->
+<!-- docs: sync from coderbuzz/codex@e61149f -->
 
 # KVS Server: AI Agent Knowledge File
 
@@ -83,6 +83,27 @@ process.on("SIGINT", async () => {
 
 ---
 
+## Upgrading from kvs-server 5
+
+kvs-server 6 needs `@coderbuzz/kvs` 0.5:
+
+- A credential scoped to a key prefix reaches the prefix key itself and its children, not a string sibling that shares its bytes (`["tenant", "a\u0000x"]` for `["tenant", "a"]`).
+- `/kv/list` with `prefix` returns the children only (not the prefix key), `prefix: []` lists every key, and `prefix` with `start`/`end` is a 400.
+- Entry versions are store-wide versionstamps, not 1, 2, 3 per key.
+- A key over 2 KiB encoded, `NaN` in a key, or a value kvs cannot store is a `400`.
+- A stored `bigint` is sent as a decimal string (it used to be impossible to store; JSON has no bigint). `Date`, `Map`, `Set` and `Uint8Array` values go out as `JSON.stringify` writes them.
+
+## Upgrading from kvs-server 4
+
+kvs-server 5 needs `@coderbuzz/kvs` 0.4. The queue protocol changed:
+
+- `/queue/ack` takes `{ id, token }`; `token` comes with every dequeued or pushed message.
+- A WebSocket listener pushes at most `concurrency` (default 1) messages until they are acked or nacked. kvs-server 4 pushed and forgot, so every message was out at once and nothing was retried until the store's timer.
+- New routes: `/queue/nack`, `/queue/extend`, `/queue/dead`, `/queue/retry-dead`, `/queue/delete-dead`, `/queue/stats`.
+- A topic-scoped queue credential can now ack (with the token).
+- A body that fails its schema is a `400`, not a `500`.
+
+
 ## `createServer(store, options): AppServer`
 
 Creates an HTTP server wrapping a sync `KVStore`.
@@ -145,7 +166,7 @@ interface WatchHubOptions {
 | `admin` | everything, including reset, clean-expired, watch-stats |
 
 - `accessToken`, `readToken`, `writeToken`, `adminToken`, and `credentials[]` are merged into one token map. Empty or duplicate tokens throw at construction.
-- Key scopes compare encoded-key byte prefixes. A scoped `/kv/list` must pass a `prefix` inside an allowed prefix (`start`/`end` ranges are denied).
+- Key scopes compare encoded keys (`withinPrefix` in `auth.ts`): a key is inside a scope when its encoding equals the scope's, or starts with it followed by a key-part type byte 1..6, the same range `list({ prefix })` reads. kvs-server 5 compared raw byte prefixes, so `["tenant", "a\u0000x"]` passed for a scope `["tenant", "a"]` (KVS-16). A scoped `/kv/list` must pass a `prefix` inside an allowed prefix (`start`/`end` ranges are denied).
 - Scoped queue credentials (`queueTopics` set) may ack/nack/extend: the lease token proves the message came from an allowed topic. They must pass `topic` to `/queue/stats`.
 - `softBufferBytes > hardBufferBytes` throws at construction.
 
@@ -396,7 +417,9 @@ Omit `topic` for every topic (unscoped credentials only).
 
 **Authorization.** `ack`, `nack` and `extend` need the `queue-ack` action but no topic check: the lease token is only handed out by a dequeue from an allowed topic (0.3 refused every ack from a topic-scoped credential). `dead`, `retry-dead` and `delete-dead` are the `queue-dead` action and `stats` is `queue-stats`, both topic-checked; a scoped credential must name a topic for `stats`.
 
-**Validation.** The REST bodies go through veta; a body that fails its schema is a `400 { "error": "Bad Request", "reason": "<veta message>" }` (0.3 answered every schema failure with a 500). kvs's own `RangeError`/`TypeError` (e.g. `limit: 1.5` passes the schema `min: 1` but not the store) are mapped to the same 400 by the queue routes and `/kv/list`.
+**Validation.** The REST bodies go through veta; a body that fails its schema is a `400 { "error": "Bad Request", "reason": "<veta message>" }` (0.3 answered every schema failure with a 500). kvs's own `RangeError`/`TypeError` whose message starts with `"kvs: "` (a key over `maxKeySize`, `NaN` in a key, an unsupported value, `prefix` with `start`, `limit: 1.5`) are mapped to the same 400 on every route by `mapValidationErrors` (`isKvsInputError`); any other error stays velox's logged 500.
+
+**Values on the wire.** Responses that carry stored values go through `json()`/`stringify()` (`src/errors.ts`): plain `JSON.stringify` first, and only if it throws a `TypeError` (a bigint) again with a replacer that writes bigints as decimal strings. Watch pushes and WS results use the same `stringify`. Other kvs 0.5 typed values take their `JSON.stringify` form (Date → ISO string, Map/Set → `{}`, Uint8Array → `{"0":…}`, undefined dropped, NaN → null); keep such values to the local store API or convert them yourself.
 
 ---
 
@@ -743,3 +766,5 @@ bun run --cwd packages/kvs-server bench:watch -- \
 14. kvs-server 5 needs `@coderbuzz/kvs` ^0.4 (queue v2 store API). A 0.3 store has no `nack`/`listDead`/`queueStats`.
 15. A WebSocket listener with the default `concurrency: 1` processes one message at a time per connection. Raise it for throughput; the client must ack or nack every pushed message, or its slot stays taken until the lease ends.
 16. WS RPC params are not schema-validated; kvs validates the queue arguments itself and the error comes back as `{ id, error }`.
+17. kvs-server 6 needs `@coderbuzz/kvs` ^0.5 (versionstamps, typed values, prefix semantics).
+18. `list` with `prefix` no longer returns the prefix key itself; a scoped credential for `["tenant", "a"]` still reads `["tenant", "a"]` with `/kv/get`.
