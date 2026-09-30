@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@e61149f -->
+<!-- docs: sync from coderbuzz/codex@d1487ff -->
 
 # KVS Server: `@coderbuzz/kvs-server`
 
@@ -29,7 +29,7 @@ KVS Server wraps `@coderbuzz/kvs` (`KVStore` or `AsyncKVStore`) into a productio
 
 ## Features
 
-- **REST API**: full CRUD, list, atomic transactions, queue operations, manual expiry
+- **REST API**: full CRUD, batch reads (`/kv/get-many`), list (ranges inside a prefix too), atomic transactions with `sum` counters, queue operations, manual expiry
 - **WebSocket RPC**: lower latency than REST for high-throughput workloads
 - **Scoped bearer auth**: read/write/queue/admin roles with encoded key-prefix and queue-topic scopes
 - **Grouped WebSocket watch**: one store watch and serialization per identical ordered subscription
@@ -63,6 +63,8 @@ npm install @coderbuzz/kvs @coderbuzz/velox @coderbuzz/kvs-server
 ```
 
 KVS Server has two peer dependencies: `@coderbuzz/kvs` (the store engine) and `@coderbuzz/velox` (the HTTP/WS framework). `@coderbuzz/veta` (request validation) is a regular dependency and installs automatically.
+
+**Runtime: Bun 1.2.21 or newer** (`engines.bun`), because `@coderbuzz/kvs` is Bun-only. Clients on Node, Deno or browsers talk to it over HTTP/WS, e.g. with `@coderbuzz/kvs-client`.
 
 ---
 
@@ -112,12 +114,21 @@ process.on("SIGINT", async () => {
 
 ---
 
+## Upgrading from kvs-server 6.0
+
+kvs-server 6.1 needs `@coderbuzz/kvs` 0.6. Additions only:
+
+- `POST /kv/get-many` (and WS `/kv/get-many`): up to 1000 keys in one call, one slot per key.
+- `/kv/atomic` takes `{ "type": "sum", "key": [...], "value": <number> }` mutations.
+- `/kv/list` with `prefix` plus `start`/`end` narrows the range inside the prefix (6.0: a 400). A bound outside the prefix is still a 400, for every credential.
+- Over WebSocket, an unknown mutation type in `/kv/atomic` is an error and nothing is written (6.0 skipped it and committed the rest with `{ ok: true }`).
+
 ## Upgrading from kvs-server 5
 
 kvs-server 6 needs `@coderbuzz/kvs` 0.5:
 
 - A credential scoped to a key prefix reaches the prefix key itself and its children, not a string sibling that shares its bytes (`["tenant", "a\u0000x"]` for `["tenant", "a"]`).
-- `/kv/list` with `prefix` returns the children only (not the prefix key), `prefix: []` lists every key, and `prefix` with `start`/`end` is a 400.
+- `/kv/list` with `prefix` returns the children only (not the prefix key), `prefix: []` lists every key, and `prefix` with `start`/`end` is a 400 (6.1 accepts bounds inside the prefix).
 - Entry versions are store-wide versionstamps, not 1, 2, 3 per key.
 - A key over 2 KiB encoded, `NaN` in a key, or a value kvs cannot store is a `400`.
 - A stored `bigint` is sent as a decimal string (it used to be impossible to store; JSON has no bigint). `Date`, `Map`, `Set` and `Uint8Array` values go out as `JSON.stringify` writes them.
@@ -215,6 +226,23 @@ GET /health
 { "entry": null }
 ```
 
+#### `POST /kv/get-many`
+
+```json
+// Request: up to 1000 keys
+{ "keys": [["users", "alice"], ["users", "nobody"], ["settings", "alice"]] }
+
+// Response: one slot per key, in order, null when absent or expired
+{ "entries": [
+  { "key": ["users", "alice"], "value": { "name": "Alice" }, "version": 1843 },
+  null,
+  { "key": ["settings", "alice"], "value": { "theme": "dark" }, "version": 1790 }
+] }
+```
+- A `get` for authorization: the `read` role may call it, and a credential scoped to key prefixes gets a `403` when any key is outside them (nothing is read).
+- More than 1000 keys, an empty key or a key over 2 KiB is a `400`. `"keys": []` returns `{ "entries": [] }`.
+- The keys are read in one statement (one read transaction on `createServer`), so the entries come from one snapshot.
+
 #### `POST /kv/set`
 
 ```json
@@ -246,6 +274,9 @@ GET /health
 // Request: range
 { "start": ["events", 1000], "end": ["events", 2000] }
 
+// Request: a range inside a prefix (start inclusive, end exclusive)
+{ "prefix": ["orders"], "start": ["orders", "2026-09"], "end": ["orders", "2026-10"] }
+
 // Request: paginated
 { "prefix": ["logs"], "limit": 20, "cursor": "Abc..." }
 
@@ -263,8 +294,9 @@ GET /health
 ```
 - `cursor` is base64-encoded exclusive start key for pagination. `null` = no more pages.
 - Default `limit`: 100, max 1000.
-- An invalid `cursor` (outside the requested prefix or range) or `limit`, or `prefix` together with `start`/`end`, returns `400 { "error": "Bad Request", "reason": "..." }`.
+- An invalid `cursor` (outside the requested prefix or range) or `limit`, or a `start`/`end` that is not a key inside `prefix`, returns `400 { "error": "Bad Request", "reason": "..." }`.
 - `prefix` lists the children of the prefix, not the prefix key itself; `prefix: []` lists every key (kvs 0.5).
+- A credential scoped to key prefixes must send a `prefix` inside its scope; its `start`/`end` must then be inside that `prefix` (else 400), so it can never read past its scope.
 
 #### `POST /kv/atomic`
 
@@ -278,6 +310,7 @@ GET /health
   "mutations": [
     { "type": "set", "key": ["counter"], "value": 4 },
     { "type": "set", "key": ["meta"], "value": { "updatedAt": 123456 }, "ttl": 3600000 },
+    { "type": "sum", "key": ["stats", "updates"], "value": 1 },
     { "type": "delete", "key": ["old-key"] }
   ],
   "enqueues": [
@@ -298,6 +331,7 @@ GET /health
 - `version: null` = "key must not exist".
 - `version: number` = "key must be at this exact version".
 - All three sections (`checks`, `mutations`, `enqueues`) are optional but at least one should be present.
+- `sum` adds `value` (a finite number) to the number at `key`: a missing or expired key becomes `value`, a live key keeps its TTL. A `sum` on a stored non-number, or a `value` that is not a finite number, is a `400` with a `reason` (`kvs: atomic().sum() needs a number, ...` / `... delta must be a finite number, ...`) and nothing is written. `sum` is a write: roles and key scopes apply as for `set`.
 
 #### `POST /kv/reset`
 
@@ -499,10 +533,11 @@ ws://host:port/ws?token=ACCESS_TOKEN
 |---|---|---|
 | `auth` | `{ token: string }` | `{ ok: true }` |
 | `/kv/get` | `{ key: KvKey }` | `{ entry: KvEntry \| null }` |
+| `/kv/get-many` | `{ keys: KvKey[] }` (max 1000) | `{ entries: (KvEntry \| null)[] }` |
 | `/kv/set` | `{ key, value, ttl? }` | `KvCommitResult` |
 | `/kv/delete` | `{ key }` | `{ ok: true }` |
 | `/kv/list` | `{ prefix?, start?, end?, limit?, cursor?, reverse? }` | `KvListResult` |
-| `/kv/atomic` | `{ checks?, mutations?, enqueues? }` | `KvCommitResult \| { ok: false }` |
+| `/kv/atomic` | `{ checks?, mutations?, enqueues? }` (mutation `type`: `set`, `delete`, `sum`) | `KvCommitResult \| { ok: false }` |
 | `/kv/reset` | `{}` | `{ ok: true }` |
 | `/kv/clean-expired` | `{}` | `{ ok: true, deleted }` |
 | `/kv/watch` | `{ keys: KvKey[] }` | (no response, push events follow) |
@@ -517,8 +552,6 @@ ws://host:port/ws?token=ACCESS_TOKEN
 | `/queue/delete-dead` | `{ topic?, id? }` | `{ count }` |
 | `/queue/stats` | `{ topic? }` | `{ stats: QueueStats[] }` |
 | `/queue/listen` | `{ topic?, concurrency?, visibilityTimeout? }` (topic default `"default"`) | (no response, push events follow) |
-| `/queue/unlisten` | `{ topic? }` | (no response) |
-| `/queue/listen` | `{ topic? }` (default `"default"`) | (no response, push events follow) |
 | `/queue/unlisten` | `{ topic? }` | (no response) |
 | `/debug/watch-stats` | `{}` | `{ store: KvWatchDiagnostics, server: WatchHubDiagnostics, queue: KvQueueDiagnostics }` (admin) |
 
@@ -628,7 +661,7 @@ enqueue → pending ──dequeue / push──▶ processing (leased) ──ack�
 7. `reset()` is admin-only, deletes ALL data, and emits reset tombstones while preserving active watches. It is not reversible.
 8. The server uses velox internally: `AppServer` has `.printRoutes()` for debugging registered endpoints.
 9. TTL cleanup and queue maintenance timers run within the KVStore instance, not the server. `KVStore` starts them on construction, `AsyncKVStore` on its first operation; both stop on store `.close()`.
-10. No `increment` HTTP/WS endpoint. Increment is a store-level operation, not exposed as a separate RPC. Use `get` + `set` or `atomic()` for counters.
+10. No `increment` HTTP/WS endpoint. Use a `sum` mutation in `/kv/atomic` for counters: it is atomic on every backend and needs no read. The response is `{ ok, version }`, not the new value; read it with `/kv/get` when you need it.
 
 ### Watch benchmark harness
 

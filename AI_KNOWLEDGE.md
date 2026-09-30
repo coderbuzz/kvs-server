@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@e61149f -->
+<!-- docs: sync from coderbuzz/codex@d1487ff -->
 
 # KVS Server: AI Agent Knowledge File
 
@@ -7,6 +7,7 @@
 **Distribution:** ESM only (`dist/index.js` + `dist/index.d.ts`).
 **Built on:** [velox](https://github.com/coderbuzz/velox) (runtime auto-detected; `Bun.serve` on Bun) + [veta](https://github.com/coderbuzz/veta) (schema validation)
 **Dependencies:** `@coderbuzz/veta` (regular). **Peer dependencies:** `@coderbuzz/kvs`, `@coderbuzz/velox`. Install: `npm install @coderbuzz/kvs @coderbuzz/velox @coderbuzz/kvs-server`.
+**Runtime:** Bun ≥ 1.2.21 (`engines.bun`), because `@coderbuzz/kvs` is Bun-only (velox itself runs elsewhere too). The suite (110 tests) passes on Bun 1.2.21 and 1.4.2.
 
 ---
 
@@ -82,6 +83,17 @@ process.on("SIGINT", async () => {
 ```
 
 ---
+
+## Upgrading from kvs-server 6.0
+
+kvs-server 6.1 needs `@coderbuzz/kvs` ^0.6 (`getMany`, `atomic().sum`). Additive, no breaking change for clients:
+
+- New `POST /kv/get-many` and WS `/kv/get-many`.
+- `/kv/atomic` accepts `type: "sum"` mutations (HTTP and WS).
+- `/kv/list` with `prefix` + `start`/`end` narrows inside the prefix; 6.0 answered 400 `kvs: list() takes { prefix } or { start, end }, not both`. A bound outside the prefix is still 400.
+- On `createAsyncServer` with PostgreSQL, a `sum` on a non-number is a 400 like on SQLite: kvs 0.6 maps PostgreSQL's NUMERIC cast error to its own `TypeError`.
+- An unknown mutation type over WS is an error with nothing written (6.0 skipped it and answered `{ ok: true }` for the rest).
+- Internal: the `/kv/atomic` body schema and the mutation dispatch live in `src/atomic.ts`, shared by both servers and both transports.
 
 ## Upgrading from kvs-server 5
 
@@ -207,6 +219,25 @@ GET /health
 
 Validated by veta: `key` must be `array(union([string, number, bigint, boolean, uint8array]), { min: 1 })`.
 
+#### `POST /kv/get-many`
+
+```json
+// Request
+{ "keys": [["users", "alice"], ["users", "nobody"], ["settings", "alice"]] }
+
+// Response: one slot per key, in request order
+{ "entries": [
+  { "key": ["users", "alice"], "value": { "name": "Alice" }, "version": 1843 },
+  null,
+  { "key": ["settings", "alice"], "value": { "theme": "dark" }, "version": 1790 }
+] }
+```
+- Validated by veta: `keys` → `array(kvKey)` (no minimum: `[]` answers `{ "entries": [] }`; an empty key `[]` inside is a 400).
+- Authorization: action `get` over every key (`read`, `write` and `admin` roles). A scoped credential with any key outside its prefixes gets `403 { "error": "Forbidden", "reason": "key is outside the allowed prefixes" }` before anything is read, so the response never mixes allowed and denied keys.
+- Store errors are 400 with `reason`: more than 1000 keys (`kvs: getMany() reads at most 1000 keys, got N`), a key over `maxKeySize`.
+- `createServer` reads the keys in one SQLite read transaction; `createAsyncServer` in one `SELECT ... WHERE key IN (...)` (one snapshot on both).
+- Values go out through the same bigint-safe JSON as `/kv/get`.
+
 #### `POST /kv/set`
 
 ```json
@@ -239,6 +270,9 @@ Validated by veta: `key` must be `array(union([string, number, bigint, boolean, 
 // Request: range
 { "start": ["events", 1000], "end": ["events", 2000] }
 
+// Request: a range inside a prefix (kvs 0.6): start inclusive, end exclusive
+{ "prefix": ["orders"], "start": ["orders", "2026-09"], "end": ["orders", "2026-10"] }
+
 // Request: paginated
 { "prefix": ["logs"], "limit": 20, "cursor": "Abc..." }
 
@@ -257,6 +291,7 @@ Validated by veta: `key` must be `array(union([string, number, bigint, boolean, 
 - All fields optional: `prefix`, `start`, `end`, `limit` (min 1), `cursor`, `reverse`.
 - `cursor` is base64-encoded exclusive start key for pagination. `null` = no more pages.
 - `400 { "error": "Bad Request", "reason": "kvs: ..." }` when kvs rejects the options: a `cursor` outside the requested `prefix`/range (a scoped credential cannot page out of its prefix with a forged cursor), or a `limit` that is not an integer ≥ 1 (e.g. `2.5`). Before this release, with kvs ≤ 0.3.1, the forged cursor returned other prefixes' entries with 200, and `limit: 2.5` was a 500. Over WS RPC the same case replies `{ "id": n, "error": "RangeError: kvs: ..." }`.
+- `prefix` + `start`/`end`: each bound must be a child of `prefix`, else `400` with `reason: "kvs: list() start must be a key inside the prefix"` (or `end`); over WS `{ "id": n, "error": "TypeError: kvs: list() start must be a key inside the prefix" }`. Scoped credentials are authorized on `prefix` alone (it must be inside an allowed prefix); the bound rule then keeps the whole range inside `prefix`, so `{ "prefix": ["tenant", "a"], "start": ["tenant", "b"] }` is a 400 and never returns tenant b's rows (tested for sync and async servers, HTTP and WS).
 - Default `limit` on store side: 100, max 1000.
 
 #### `POST /kv/atomic`
@@ -271,6 +306,7 @@ Validated by veta: `key` must be `array(union([string, number, bigint, boolean, 
   "mutations": [
     { "type": "set", "key": ["counter"], "value": 4 },
     { "type": "set", "key": ["meta"], "value": { "updatedAt": 123456 }, "ttl": 3600000 },
+    { "type": "sum", "key": ["stats", "updates"], "value": 1 },
     { "type": "delete", "key": ["old-key"] }
   ],
   "enqueues": [
@@ -291,7 +327,9 @@ Validated by veta: `key` must be `array(union([string, number, bigint, boolean, 
 - `version: null` = "key must not exist".
 - `version: number` = "key must be at this exact version".
 - All three sections (`checks`, `mutations`, `enqueues`) are optional but at least one should be present.
-- Validation: `checks` → `array(object({ key: kvKey, version: nullable(number) }))`, `mutations` → `array(object({ type: union([literal("set"), literal("delete")]), key: kvKey, value: optional(unknown), ttl: optional(number({ min: 0 })) }))`, `enqueues` → `array(object({ payload: unknown, options: optional(object({ topic: optional(string), delay: optional(number({ min: 0 })), maxAttempts: optional(number({ min: 1 })) })) }))`.
+- `sum` (kvs 0.6): `value` is the delta. Semantics are the store's `atomic().sum()` (missing/expired → delta without TTL, live key keeps its TTL, sees earlier mutations of the same request). Errors, all `400` with nothing written: stored non-number → `reason: "kvs: atomic().sum() needs a number, but the key holds string"` (PostgreSQL: `... holds a non-numeric value`); `value` missing, `null`, a string or not finite → `reason: "kvs: atomic().sum() delta must be a finite number, got X"`. Over WS the same text comes back as `{ "id": n, "error": "TypeError: kvs: ..." }` / `"RangeError: ..."`. Authorization: its key counts as an `atomic` key (write roles, key scopes).
+- An unknown mutation type: REST 400 from the schema; WS `{ "id": n, "error": "TypeError: kvs-server: unknown mutation type \"min\" (set, delete or sum)" }`, checked before anything is added to the commit, so nothing is written. kvs-server 6.0 skipped it over WS and committed the other mutations with `{ ok: true }`.
+- Validation: `checks` → `array(object({ key: kvKey, version: nullable(number) }))`, `mutations` → `array(object({ type: union([literal("set"), literal("delete"), literal("sum")]), key: kvKey, value: optional(unknown), ttl: optional(number({ min: 0 })) }))`, `enqueues` → `array(object({ payload: unknown, options: optional(object({ topic: optional(string), delay: optional(number({ min: 0 })), maxAttempts: optional(number({ min: 1 })) })) }))`.
 
 #### `POST /kv/reset`
 
@@ -510,10 +548,11 @@ The watch push is built as `{ type, entries, sequence, reset: event.reset || und
 |---|---|---|
 | `auth` | `{ token: string }` | `{ ok: true }` |
 | `/kv/get` | `{ key: KvKey }` | `{ entry: KvEntry \| null }` |
+| `/kv/get-many` | `{ keys: KvKey[] }` (max 1000; not an array → `Forbidden: keys must be an array of keys`) | `{ entries: (KvEntry \| null)[] }` |
 | `/kv/set` | `{ key, value, ttl? }` | `KvCommitResult` |
 | `/kv/delete` | `{ key }` | `{ ok: true }` |
 | `/kv/list` | `{ prefix?, start?, end?, limit?, cursor?, reverse? }` | `KvListResult` |
-| `/kv/atomic` | `{ checks?, mutations?, enqueues? }` | `KvCommitResult \| { ok: false }` |
+| `/kv/atomic` | `{ checks?, mutations?, enqueues? }` (mutation `type`: `set`, `delete`, `sum`) | `KvCommitResult \| { ok: false }` |
 | `/kv/reset` | `{}` | `{ ok: true }` |
 | `/kv/clean-expired` | `{}` | `{ ok: true, deleted }` |
 | `/kv/watch` | `{ keys: KvKey[] }` | (no direct response, push events) |
@@ -529,13 +568,11 @@ The watch push is built as `{ type, entries, sequence, reset: event.reset || und
 | `/queue/stats` | `{ topic? }` | `{ stats: QueueStats[] }` |
 | `/queue/listen` | `{ topic?, concurrency?, visibilityTimeout? }` (topic default `"default"`) | (no response, push events follow) |
 | `/queue/unlisten` | `{ topic? }` | (no response) |
-| `/queue/listen` | `{ topic? }` (default `"default"`) | (no direct response, push events) |
-| `/queue/unlisten` | `{ topic? }` | (no response) |
 | `/debug/watch-stats` | `{}` | `{ store: KvWatchDiagnostics, server: WatchHubDiagnostics, queue: KvQueueDiagnostics }` (admin) |
 
 WS RPC params are not schema-validated (only REST bodies go through veta). Invalid params surface as handler errors.
 
-Note: No `/kv/increment` endpoint. Increment is a store-level operation. Use `/kv/get` + `/kv/set` or `/kv/atomic` with version checks for atomic counters.
+Note: No `/kv/increment` endpoint. Use a `sum` mutation in `/kv/atomic` (kvs 0.6): atomic on every backend, no read, no version check. The reply is `{ ok, version }`, not the new value.
 
 ### WebSocket Watch
 
@@ -709,7 +746,7 @@ Routes are registered in this order:
 0. `mapValidationErrors(app)` (`src/errors.ts`): `app.onError` answers a `VetaError` with 400 and rethrows everything else to velox's default (logged 500, no error text in the body)
 1. `GET /health`: unprotected
 2. `app.apply("/kv/*", auth)` and `app.apply("/queue/*", auth)`, where `auth = { auth: bearerAuth({ token: verifier.tokens }) }`
-3. KV POST endpoints: `/kv/get`, `/kv/set`, `/kv/delete`, `/kv/list`, `/kv/atomic`
+3. KV POST endpoints: `/kv/get`, `/kv/get-many`, `/kv/set`, `/kv/delete`, `/kv/list`, `/kv/atomic` (body schemas of `/kv/get-many` and `/kv/atomic` and the mutation dispatch `buildAtomic()` in `src/atomic.ts`)
 4. Queue POST endpoints: `/queue/enqueue` (route file), then `registerQueueRoutes()` from `queue-routes.ts`: `/queue/dequeue`, `/queue/ack`, `/queue/nack`, `/queue/extend`, `/queue/dead`, `/queue/retry-dead`, `/queue/delete-dead`, `/queue/stats`
 5. Admin KV POST endpoints: `/kv/reset`, `/kv/clean-expired`, `/kv/watch-stats`
 6. WebSocket: `app.ws("/ws", { upgrade, open, message, drain, close }, { maxPayloadLength, backpressureLimit, closeOnBackpressureLimit: true })`
@@ -758,7 +795,7 @@ bun run --cwd packages/kvs-server bench:watch -- \
 6. Queue endpoints require auth. ack/nack/extend need the lease token (`400` without it); a wrong or stale token is `{ ok: false }`, not an error.
 7. `reset()` is admin-only, deletes ALL data, emits reset tombstones, and is not reversible.
 8. The server uses velox internally: `AppServer` has `.printRoutes()` for debugging registered endpoints.
-9. No `/kv/increment` endpoint. The store's `increment()` is not exposed via HTTP/WS. Use `get` + `set` or `atomic()` with version checks for atomic counters.
+9. No `/kv/increment` endpoint. The store's `increment()` is not exposed via HTTP/WS; a `sum` mutation in `/kv/atomic` does the same inside a commit (kvs-server 6.1).
 10. Value serialization happens at the store level (1-byte sentinel + JSON.stringify → binary blob). The server just passes values through.
 11. TTL cleanup and queue maintenance timers run within the KVStore/AsyncKVStore instance (`KVStore`: started in constructor; `AsyncKVStore`: started on first operation), stopped on `.close()`. Not managed by the server layer.
 12. Neither `createServer` nor `app.stop()` closes the store or the WatchHub; close the store yourself on shutdown.
@@ -768,3 +805,5 @@ bun run --cwd packages/kvs-server bench:watch -- \
 16. WS RPC params are not schema-validated; kvs validates the queue arguments itself and the error comes back as `{ id, error }`.
 17. kvs-server 6 needs `@coderbuzz/kvs` ^0.5 (versionstamps, typed values, prefix semantics).
 18. `list` with `prefix` no longer returns the prefix key itself; a scoped credential for `["tenant", "a"]` still reads `["tenant", "a"]` with `/kv/get`.
+19. kvs-server 6.1 needs `@coderbuzz/kvs` ^0.6: a 0.5 store has no `getMany`/`sum` (the route would throw `is not a function`, a 500).
+20. `/kv/get-many` is all-or-nothing on authorization: one key outside a scoped credential's prefixes denies the whole call (403). Split the keys per scope on the client.
