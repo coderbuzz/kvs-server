@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@8854676 -->
+<!-- docs: sync from coderbuzz/codex@5aee801 -->
 
 # KVS Server: AI Agent Knowledge File
 
@@ -768,14 +768,14 @@ the handler verifies role, key scope, atomic contents, and queue topic.
 
 Transport overhead vs direct `KVStore`. Source of truth: `https://raw.githubusercontent.com/coderbuzz/benchmarks/main/results/latest.json` (suite ids `kvs-server-set`, `kvs-server-get`); quote numbers from there only.
 
-Numbers from [github.com/coderbuzz/benchmarks](https://github.com/coderbuzz/benchmarks) (`results/latest.json`): cloud reference machine (Intel Xeon @ 2.10GHz, CPU model 207, 4 cores, Linux x64), Bun 1.4.2, run of 2026-10-10 (benchmarks `131fcc5`). @coderbuzz/kvs-server 6.1.4: one client calling sequentially, each operation awaited, against an in-process `KVStore`; ops/s, best of 3 processes.
+Numbers from [github.com/coderbuzz/benchmarks](https://github.com/coderbuzz/benchmarks) (`results/latest.json`): reference VM (Intel Xeon Platinum 8255C @ 2.50GHz, 4 cores, Linux x64), Bun 1.4.3, run of 2026-10-10 (benchmarks `6ed4ccf`). @coderbuzz/kvs-server 6.1.4: one client calling sequentially, each operation awaited, against an in-process `KVStore`; ops/s, best of 3 processes.
 
 | Scenario | KVS direct | WS RPC | HTTP REST |
 |---|---|---|---|
-| set('k','v') | **540,959 ops/s** | 31,288 ops/s (17.3x slower) | 14,765 ops/s (36.6x slower) |
-| get('k'), hit | **684,817 ops/s** | 31,919 ops/s (21.5x slower) | 14,376 ops/s (47.6x slower) |
+| set('k','v') | **348,927 ops/s** | 28,225 ops/s (12.4x slower) | 5,805 ops/s (60.1x slower) |
+| get('k'), hit | **436,579 ops/s** | 29,483 ops/s (14.8x slower) | 5,750 ops/s (75.9x slower) |
 
-A remote call costs a network round trip that in-process access does not: HTTP REST is 37-48x slower than direct access (JSON serialization, a TCP request per call, velox routing). WebSocket RPC keeps one connection open and is about 2.1x faster than REST for writes and 2.2x for reads. These are sequential, one-at-a-time calls; concurrent clients amortize the round trip. The earlier table (Apple M-series: 8.2x / 46.4x) came from another machine and is superseded.
+A remote call costs a network round trip that in-process access does not: HTTP REST is 60-76x slower than direct access (JSON serialization, a TCP request per call, velox routing). WebSocket RPC keeps one connection open and is about 4.9x faster than REST for writes and 5.1x for reads. These are sequential, one-at-a-time calls; concurrent clients amortize the round trip. The earlier table (Apple M-series: 8.2x / 46.4x) came from another machine and is superseded.
 
 Real-socket fan-out harness (`bench/watch-fanout.ts`, script `bench:watch`), run against a separately started server:
 
