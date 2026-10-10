@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@d1487ff -->
+<!-- docs: sync from coderbuzz/codex@8854676 -->
 
 # KVS Server: `@coderbuzz/kvs-server`
 
@@ -43,16 +43,16 @@ KVS Server wraps `@coderbuzz/kvs` (`KVStore` or `AsyncKVStore`) into a productio
 
 ## Benchmarks
 
-Full results at **[github.com/coderbuzz/benchmarks](https://github.com/coderbuzz/benchmarks)**.
-
-KVS Server transport overhead vs direct KVStore access (Apple M-series, Bun):
+Numbers from [github.com/coderbuzz/benchmarks](https://github.com/coderbuzz/benchmarks) (`results/latest.json`): cloud reference machine (Intel Xeon @ 2.10GHz, CPU model 207, 4 cores, Linux x64), Bun 1.4.2, run of 2026-10-10 (benchmarks `131fcc5`). @coderbuzz/kvs-server 6.1.4: one client calling sequentially, each operation awaited, against an in-process `KVStore`; ops/s, best of 3 processes.
 
 | Scenario | KVS direct | WS RPC | HTTP REST |
 |---|---|---|---|
-| set('k','v') | **158,732 ops/s** | 53,999 ops/s (2.9x) | 19,433 ops/s (8.2x) |
-| get('k'), hit | **1,160,021 ops/s** | 55,723 ops/s (20.8x) | 24,973 ops/s (46.4x) |
+| set('k','v') | **540,959 ops/s** | 31,288 ops/s (17.3x slower) | 14,765 ops/s (36.6x slower) |
+| get('k'), hit | **684,817 ops/s** | 31,919 ops/s (21.5x slower) | 14,376 ops/s (47.6x slower) |
 
-HTTP REST overhead includes JSON serialization, TCP round-trip, and velox routing (8-46x slower than direct in the table above). WebSocket RPC amortizes connection overhead and is ~2.8x faster than REST for writes and ~2.2x for reads.
+A remote call costs a network round trip that in-process access does not: HTTP REST is 37-48x slower than direct access (JSON serialization, a TCP request per call, velox routing). WebSocket RPC keeps one connection open and is about 2.1x faster than REST for writes and 2.2x for reads. These are sequential, one-at-a-time calls; concurrent clients amortize the round trip.
+
+> Numbers move with the machine; compare them only within one run. The source of truth is `https://raw.githubusercontent.com/coderbuzz/benchmarks/main/results/latest.json`.
 
 ---
 
