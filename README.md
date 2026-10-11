@@ -1,4 +1,4 @@
-<!-- docs: sync from coderbuzz/codex@956f0b5 -->
+<!-- docs: sync from coderbuzz/codex@24a1da8 -->
 
 # KVS Server: `@coderbuzz/kvs-server`
 
@@ -43,14 +43,14 @@ KVS Server wraps `@coderbuzz/kvs` (`KVStore` or `AsyncKVStore`) into a productio
 
 ## Benchmarks
 
-Numbers from [github.com/coderbuzz/benchmarks](https://github.com/coderbuzz/benchmarks) (`results/latest.json`): cloud machine (Intel Xeon @ 2.10GHz, family 6 model 207 stepping 2, 4 cores, Linux x64), Bun 1.4.3, run of 2026-10-10 (benchmarks `31fbcee`). @coderbuzz/kvs-server 6.1.4: one client calling sequentially, each operation awaited, against an in-process `KVStore`; ops/s, best of 3 processes.
+Numbers from [github.com/coderbuzz/benchmarks](https://github.com/coderbuzz/benchmarks) (`results/latest.json`): cloud machine (Intel Xeon @ 2.80GHz, family 6 model 85 stepping 7, 4 cores, Linux x64), Bun 1.4.3, run of 2026-10-11 (benchmarks `d3093a2`). @coderbuzz/kvs-server 6.1.4: one client calling sequentially, each operation awaited, against an in-process `KVStore`; ops/s, best of 3 processes.
 
 | Scenario | KVS direct | WS RPC | HTTP REST |
 |---|---|---|---|
-| set('k','v') | **531,960 ops/s** | 84,658 ops/s (6.3x slower) | 8,436 ops/s (63.1x slower) |
-| get('k'), hit | **650,013 ops/s** | 80,852 ops/s (8.0x slower) | 8,746 ops/s (74.3x slower) |
+| set('k','v') | **357,510 ops/s** | 46,361 ops/s (7.7x slower) | 5,858 ops/s (61.0x slower) |
+| get('k'), hit | **441,618 ops/s** | 48,700 ops/s (9.1x slower) | 5,619 ops/s (78.6x slower) |
 
-A remote call costs a network round trip that in-process access does not: HTTP REST is 63-74x slower than direct access (JSON serialization, a TCP request per call, velox routing). WebSocket RPC keeps one connection open and is about 10.0x faster than REST for writes and 9.2x for reads. These are sequential, one-at-a-time calls; concurrent clients amortize the round trip.
+A remote call costs a network round trip that in-process access does not: HTTP REST is 61-79x slower than direct access (JSON serialization, a TCP request per call, velox routing). WebSocket RPC keeps one connection open and is about 7.9x faster than REST for writes and 8.7x for reads. These are sequential, one-at-a-time calls; concurrent clients amortize the round trip.
 
 > Numbers move with the machine; compare them only within one run. The source of truth is `https://raw.githubusercontent.com/coderbuzz/benchmarks/main/results/latest.json`.
 
